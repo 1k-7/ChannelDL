@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  zipper-bot:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./zipper_state.db:/app/zipper_state.db
+      - ./downloads:/app/downloads
