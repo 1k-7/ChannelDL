@@ -42,10 +42,11 @@ DB_NAME = "zipper_state.db"
 SESSION_DIR = "sessions"
 
 # --- SMART CONCURRENCY SETTINGS ---
-# The "Budget" for each bot.
-# Cost: <50MB=1, <500MB=5, >500MB=20
-BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 100))
-QUEUE_MAX_SIZE = 2000 # Buffer needs to be larger for high concurrency
+# Budget per bot. 
+# Small file cost = 1.
+# 200 = 200 concurrent small files PER BOT.
+BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 200))
+QUEUE_MAX_SIZE = 5000 # Increased buffer
 
 # Logging
 logging.basicConfig(
@@ -58,7 +59,7 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR)
 
-# --- CUSTOM SEMAPHORE FOR DYNAMIC LOAD ---
+# --- CUSTOM SEMAPHORE ---
 class WeightedSemaphore:
     def __init__(self, value=1):
         self._value = value
@@ -84,9 +85,9 @@ def create_client(name, token):
         bot_token=token,
         workdir=SESSION_DIR, 
         ipv6=False,
-        # Drastically increased to support mass small-file downloads
-        max_concurrent_transmissions=200, 
-        workers=16
+        # Allow massive parallel streams
+        max_concurrent_transmissions=256, 
+        workers=32
     )
 
 print("🔥 Initializing Clients...")
@@ -165,7 +166,6 @@ async def swarm_warmup(chat_id, target_channel):
             return True
         except (PeerIdInvalid, ChannelInvalid):
             try:
-                # Force Cache Refresh via Dialog Scan
                 async for dialog in bot.get_dialogs(limit=50):
                     if dialog.chat.id == target_channel: return True
             except: pass
@@ -215,26 +215,71 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
     await queue.put(None)
 
 def calculate_cost(msg):
-    """Dynamic Cost Calculation based on File Size."""
+    """
+    Cost System:
+    < 50 MB  = 1  (Massive parallel)
+    < 500 MB = 10 
+    > 500 MB = 50 (Heavy)
+    """
     size = 0
     if msg.document: size = msg.document.file_size
     elif msg.video: size = msg.video.file_size
     elif msg.audio: size = msg.audio.file_size
-    elif msg.photo: 
-        # Photos are small, use size of largest thumb or default small
-        size = 1024 * 1024 # Treat as 1MB
+    elif msg.photo: size = 1024 * 1024 # 1MB
 
-    # LOGIC:
-    # < 50MB   = 1 Point  (Max 100 concurrent)
-    # < 500MB  = 5 Points (Max 20 concurrent)
-    # > 500MB  = 20 Points (Max 5 concurrent)
-    
     if size < 50 * 1024 * 1024: return 1
-    if size < 500 * 1024 * 1024: return 5
-    return 20
+    if size < 500 * 1024 * 1024: return 10
+    return 50
 
-async def download_worker(client_inst, queue, chat_id, user_dir, semaphore, stop_event):
-    """CONSUMER"""
+async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost, unique_id):
+    """The actual IO task running in background."""
+    try:
+        active_downloads[chat_id][unique_id] = 0
+        
+        try:
+            f_path = await client_inst.download_media(
+                msg,
+                file_name=os.path.join(user_dir, ""),
+                progress=progress_callback,
+                progress_args=(unique_id, chat_id)
+            )
+        except (FileReferenceExpired, PeerIdInvalid):
+            # Refetch
+            fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
+            f_path = await client_inst.download_media(
+                fresh_msg,
+                file_name=os.path.join(user_dir, ""),
+                progress=progress_callback,
+                progress_args=(unique_id, chat_id)
+            )
+
+        if f_path:
+            f_size = os.path.getsize(f_path)
+            # Safe Update of shared state (Dicts are thread-safe in GIL, but good to be careful)
+            if chat_id in job_progress:
+                job_progress[chat_id]['finished_bytes'] += f_size
+                job_progress[chat_id]['current_chunk_size'] += f_size
+                job_progress[chat_id]['files'].append(f_path)
+                
+                if msg.id > job_progress[chat_id]['highest_id']:
+                    job_progress[chat_id]['highest_id'] = msg.id
+
+    except Exception as e:
+        logger.error(f"{client_inst.name} DL Fail: {e}")
+    
+    finally:
+        # Cleanup Stats
+        if unique_id in active_downloads[chat_id]:
+            del active_downloads[chat_id][unique_id]
+        # Release Budget
+        await semaphore.release(cost)
+
+async def download_dispatcher(client_inst, queue, chat_id, user_dir, semaphore, stop_event):
+    """
+    DISPATCHER:
+    Does NOT wait for download.
+    Checks budget -> Spawns Task -> Repeats immediately.
+    """
     while not stop_event.is_set():
         try:
             msg = await asyncio.wait_for(queue.get(), timeout=1.0)
@@ -248,51 +293,14 @@ async def download_worker(client_inst, queue, chat_id, user_dir, semaphore, stop
         unique_id = f"{client_inst.name}_{msg.id}"
         cost = calculate_cost(msg)
         
-        # Acquire weighted cost
+        # Block until we have budget (Semaphore)
+        # If we have 200 budget and cost is 1, we pass immediately
         await semaphore.acquire(cost)
         
-        try:
-            active_downloads[chat_id][unique_id] = 0
-            
-            # --- DOWNLOAD ---
-            try:
-                f_path = await client_inst.download_media(
-                    msg,
-                    file_name=os.path.join(user_dir, ""),
-                    progress=progress_callback,
-                    progress_args=(unique_id, chat_id)
-                )
-            except (FileReferenceExpired, PeerIdInvalid):
-                # Refetch
-                fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
-                f_path = await client_inst.download_media(
-                    fresh_msg,
-                    file_name=os.path.join(user_dir, ""),
-                    progress=progress_callback,
-                    progress_args=(unique_id, chat_id)
-                )
-
-            if f_path:
-                f_size = os.path.getsize(f_path)
-                if chat_id in job_progress:
-                    job_progress[chat_id]['finished_bytes'] += f_size
-                    job_progress[chat_id]['current_chunk_size'] += f_size
-                    job_progress[chat_id]['files'].append(f_path)
-                    
-                    if msg.id > job_progress[chat_id]['highest_id']:
-                        job_progress[chat_id]['highest_id'] = msg.id
-
-                if unique_id in active_downloads[chat_id]:
-                    del active_downloads[chat_id][unique_id]
-
-        except Exception as e:
-            logger.error(f"{client_inst.name} DL Fail: {e}")
-            if unique_id in active_downloads[chat_id]:
-                del active_downloads[chat_id][unique_id]
-        
-        finally:
-            # Always release resource
-            await semaphore.release(cost)
+        # SPAWN BACKGROUND TASK
+        asyncio.create_task(
+            perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost, unique_id)
+        )
         
         queue.task_done()
 
@@ -331,7 +339,7 @@ async def status_monitor(client, chat_id, stop_event):
                 f"🤖 **Swarm Active: {active_workers} Bots**\n"
                 f"⚡ Speed: `{avg_speed:.2f} MB/s` ({(avg_speed * 8):.0f} Mbps)\n"
                 f"📥 Queue: `{data['queue_obj'].qsize()}`\n"
-                f"🔥 Active DLs: `{active_dls_count}` (Dynamic Load)\n"
+                f"🔥 **Concurrent DLs:** `{active_dls_count}`\n"
                 f"💾 Chunk: `{(data['current_chunk_size'] + current_live)/1024/1024:.2f} MB`\n"
                 f"🔎 Scan: `{data['scanned']}` / `{data['total']}`\n"
                 f"📦 Part: `{data['part']}`\n"
@@ -379,7 +387,7 @@ async def manager_logic(chat_id):
     semaphores = [WeightedSemaphore(BOT_MAX_LOAD) for _ in all_apps]
     
     for i, app_inst in enumerate(all_apps):
-        asyncio.create_task(download_worker(app_inst, queue, chat_id, user_dir, semaphores[i], stop_event))
+        asyncio.create_task(download_dispatcher(app_inst, queue, chat_id, user_dir, semaphores[i], stop_event))
 
     asyncio.create_task(status_monitor(main_app, chat_id, stop_event))
 
