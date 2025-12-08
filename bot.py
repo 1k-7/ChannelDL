@@ -7,7 +7,13 @@ import re
 import aiosqlite
 import time
 from pyrogram import Client, filters, compose
-from pyrogram.errors import FloodWait, PeerIdInvalid, ChannelInvalid, UserNotParticipant
+from pyrogram.errors import (
+    FloodWait, 
+    PeerIdInvalid, 
+    ChannelInvalid, 
+    FileReferenceExpired, 
+    AuthKeyUnregistered
+)
 from dotenv import load_dotenv
 
 # --- SAFE IMPORTS ---
@@ -15,7 +21,7 @@ try:
     import uvloop
     uvloop.install()
 except ImportError:
-    print("⚠️ UVLOOP not found. Running in standard mode.")
+    pass
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -23,14 +29,12 @@ API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
 MAIN_BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# Parse Worker Tokens safely
 WORKER_TOKENS_STR = os.getenv("WORKER_TOKENS", "")
 WORKER_TOKENS = [t.strip() for t in WORKER_TOKENS_STR.split(",") if t.strip()]
 
-# SAFETY CHECK: Prevent Token Conflict
+# SAFETY CHECK
 if MAIN_BOT_TOKEN in WORKER_TOKENS:
-    print("❌ FATAL ERROR: Main Bot Token found in WORKER_TOKENS!")
-    print("   Remove the Main Bot Token from the worker list in .env")
+    print("❌ FATAL: Main Bot Token is also in WORKER_TOKENS. Remove it.")
     exit(1)
 
 WORK_DIR = os.getenv("WORK_DIR", "downloads")
@@ -42,7 +46,9 @@ logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("DebugBot")
+logger = logging.getLogger("SwarmBot")
+# Reduce noise
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR)
@@ -64,16 +70,14 @@ print("🔥 Initializing Clients...")
 main_app = create_client("main_bot", MAIN_BOT_TOKEN)
 worker_apps = [create_client(f"worker_{i+1}", t) for i, t in enumerate(WORKER_TOKENS)]
 all_apps = [main_app] + worker_apps
-
-print(f"✅ Swarm Loaded: 1 Manager + {len(worker_apps)} Workers")
+print(f"✅ Swarm Loaded: {len(all_apps)} Bots Total")
 
 # Global State
 setup_state = {}
 job_progress = {} 
 active_downloads = {} 
 
-# --- DATABASE & HELPERS ---
-# (Same as before, condensed for brevity)
+# --- DATABASE ---
 
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
@@ -122,12 +126,6 @@ async def delete_job(chat_id):
         await db.execute("DELETE FROM jobs WHERE chat_id = ?", (chat_id,))
         await db.commit()
 
-# --- DEBUG HANDLER ---
-@main_app.on_message(group=-1)
-async def log_everything(c, m):
-    """Prints every message received to console to verify connection."""
-    print(f"👀 RECEIVED: {m.text} from {m.chat.id}")
-
 # --- WORKER LOGIC ---
 
 async def progress_callback(current, total, unique_id, chat_id):
@@ -152,10 +150,11 @@ async def swarm_warmup(chat_id, target_channel):
     await main_app.send_message(
         chat_id, 
         f"🛡 **Swarm Warmup:** {success_count}/{len(all_apps)} bots have access.\n"
-        f"If this is low, add workers to the channel!"
+        f"Ensure all bots are admins/members of the channel."
     )
 
 async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, progress_key):
+    """PRODUCER: Main Bot Scans History."""
     current = start_id
     batch_size = 200 
     
@@ -168,9 +167,11 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
                 job_progress[progress_key]['scanned'] = current
 
             messages = await client.get_messages(target_chat, ids)
+            
             for msg in messages:
                 if msg and (msg.document or msg.video or msg.audio or msg.photo):
                     await queue.put(msg)
+            
             current = batch_end
             
         except FloodWait as e:
@@ -178,9 +179,11 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
         except Exception as e:
             logger.error(f"Fetch Error: {e}")
             await asyncio.sleep(2)
+            
     await queue.put(None)
 
 async def download_worker(client_inst, queue, chat_id, user_dir, semaphore, stop_event):
+    """CONSUMER: Worker Bots Download."""
     while not stop_event.is_set():
         try:
             msg = await asyncio.wait_for(queue.get(), timeout=2.0)
@@ -188,51 +191,117 @@ async def download_worker(client_inst, queue, chat_id, user_dir, semaphore, stop
             continue
         
         if msg is None:
-            await queue.put(None)
+            await queue.put(None) # Signal others
             break
 
         unique_id = f"{client_inst.name}_{msg.id}"
+        
         async with semaphore:
             try:
                 active_downloads[chat_id][unique_id] = 0
-                f_path = await client_inst.download_media(
-                    msg, file_name=os.path.join(user_dir, ""),
-                    progress=progress_callback, progress_args=(unique_id, chat_id)
-                )
+                
+                # --- DOWNLOAD ATTEMPT 1 ---
+                try:
+                    f_path = await client_inst.download_media(
+                        msg,
+                        file_name=os.path.join(user_dir, ""),
+                        progress=progress_callback,
+                        progress_args=(unique_id, chat_id)
+                    )
+                except FileReferenceExpired:
+                    # --- RECOVERY LOGIC ---
+                    # The worker needs its OWN reference. Fetch fresh.
+                    logger.info(f"{client_inst.name}: File Ref Expired for ID {msg.id}. Refetching...")
+                    fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
+                    f_path = await client_inst.download_media(
+                        fresh_msg,
+                        file_name=os.path.join(user_dir, ""),
+                        progress=progress_callback,
+                        progress_args=(unique_id, chat_id)
+                    )
+
                 if f_path:
                     f_size = os.path.getsize(f_path)
                     if chat_id in job_progress:
                         job_progress[chat_id]['finished_bytes'] += f_size
                         job_progress[chat_id]['current_chunk_size'] += f_size
                         job_progress[chat_id]['files'].append(f_path)
+                        
                         if msg.id > job_progress[chat_id]['highest_id']:
                             job_progress[chat_id]['highest_id'] = msg.id
-                    if unique_id in active_downloads[chat_id]: del active_downloads[chat_id][unique_id]
-            except Exception as e:
-                logger.error(f"{client_inst.name} DL Fail: {e}")
+
+                    if unique_id in active_downloads[chat_id]:
+                        del active_downloads[chat_id][unique_id]
+
+            except FloodWait as e:
+                logger.warning(f"{client_inst.name} Hit FloodWait: {e.value}s")
+                await asyncio.sleep(e.value + 1)
+                # Retry logic could be added here, but for now we might skip or fail
                 if unique_id in active_downloads[chat_id]: del active_downloads[chat_id][unique_id]
+
+            except Exception as e:
+                logger.error(f"{client_inst.name} DL Fail {msg.id}: {e}")
+                if unique_id in active_downloads[chat_id]:
+                    del active_downloads[chat_id][unique_id]
+        
         queue.task_done()
 
 async def status_monitor(client, chat_id, stop_event):
     msg = await client.send_message(chat_id, "⏳ **Swarm Starting...**")
     last_text = ""
+    last_bytes_total = 0
+    last_check_time = time.time()
+    
+    # Store previous speed to avoid flickering 0.00
+    avg_speed = 0.0
+
     while not stop_event.is_set():
         try:
             data = job_progress.get(chat_id)
             if not data: break
             
-            live_bytes = sum(active_downloads.get(chat_id, {}).values())
-            total = data['finished_bytes'] + live_bytes
+            # 1. Calculate Total Processed (Disk + Network Buffer)
+            current_live = sum(active_downloads.get(chat_id, {}).values())
+            total_now = data['finished_bytes'] + current_live
             
-            # Simple UI update
-            text = (f"🤖 **Swarm Active**\n💾 Chunk: `{total/1024/1024:.2f} MB`\n"
-                    f"🔎 Scan: `{data['scanned']}` / `{data['total']}`\n"
-                    f"📦 Part: `{data['part']}`")
+            # 2. Time Delta
+            now = time.time()
+            time_diff = now - last_check_time
+            
+            # 3. Calculate Speed every 2 seconds
+            if time_diff >= 2.0:
+                bytes_diff = total_now - last_bytes_total
+                
+                # Prevent negative speed (rare race condition)
+                if bytes_diff < 0: bytes_diff = 0
+                
+                current_speed = (bytes_diff / time_diff) / (1024 * 1024) # MB/s
+                
+                # Simple Moving Average for smoothness
+                avg_speed = (avg_speed * 0.7) + (current_speed * 0.3)
+                
+                last_bytes_total = total_now
+                last_check_time = now
+
+            # 4. Format Text
+            text = (
+                f"🤖 **Swarm Active**\n"
+                f"⚡ Speed: `{avg_speed:.2f} MB/s` ({(avg_speed * 8):.0f} Mbps)\n"
+                f"📥 Queue: `{data['queue_obj'].qsize()}`\n"
+                f"💾 Chunk: `{(data['current_chunk_size'] + current_live)/1024/1024:.2f} MB`\n"
+                f"🔎 Scan: `{data['scanned']}` / `{data['total']}`\n"
+                f"📦 Part: `{data['part']}`"
+            )
+
             if text != last_text:
                 await msg.edit_text(text)
                 last_text = text
-            await asyncio.sleep(4)
-        except: pass
+            
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.error(f"Monitor Error: {e}")
+            await asyncio.sleep(2)
+            
     await msg.delete()
 
 async def manager_logic(chat_id):
@@ -256,41 +325,57 @@ async def manager_logic(chat_id):
     }
     active_downloads[chat_id] = {}
 
+    # Start Fetcher
     fetch_task = asyncio.create_task(
         fetch_worker(main_app, job['target'], job['last_id'], job['end_id'], queue, stop_event, chat_id)
     )
 
+    # Start Downloaders (10 concurrent per bot)
     semaphores = [asyncio.Semaphore(10) for _ in all_apps]
     for i, app_inst in enumerate(all_apps):
         asyncio.create_task(download_worker(app_inst, queue, chat_id, user_dir, semaphores[i], stop_event))
 
+    # Start Monitor
     asyncio.create_task(status_monitor(main_app, chat_id, stop_event))
 
     while not stop_event.is_set():
         await asyncio.sleep(2)
+        
         is_full = job_progress[chat_id]['current_chunk_size'] >= job['max_size']
         is_finished = fetch_task.done() and queue.empty() and not active_downloads.get(chat_id)
         
         if is_full or (is_finished and job_progress[chat_id]['files']):
             files = list(job_progress[chat_id]['files'])
+            # Clear buffer immediately to prevent double zipping
             job_progress[chat_id]['files'] = []
             job_progress[chat_id]['current_chunk_size'] = 0
             
-            zip_name = job['naming'].format(job_progress[chat_id]['part']) + ".zip"
+            zip_name = job['naming'].format(job_progress[chat_id]['part'])
+            if not zip_name.endswith(".zip"): zip_name += ".zip"
             zip_path = os.path.join(user_dir, zip_name)
             
             await main_app.send_message(chat_id, f"🤐 **Zipping {zip_name}...**")
             
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zipf:
-                for f in files:
-                    if os.path.exists(f): zipf.write(f, os.path.basename(f))
+            # Zip in thread
+            await asyncio.to_thread(zip_files, files, zip_path)
             
             end_id = job_progress[chat_id]['highest_id']
-            await main_app.send_document(chat_id, zip_path, caption=f"🗂 **{zip_name}**\nID: {end_id}")
-            
-            job_progress[chat_id]['part'] += 1
-            await update_checkpoint(chat_id, end_id, job_progress[chat_id]['part'])
-            
+            try:
+                await main_app.send_document(
+                    chat_id, 
+                    zip_path, 
+                    caption=f"🗂 **{zip_name}**\nUP TO ID: {end_id}"
+                )
+                
+                # Update DB only on success
+                job_progress[chat_id]['part'] += 1
+                await update_checkpoint(chat_id, end_id, job_progress[chat_id]['part'])
+                
+            except Exception as e:
+                logger.error(f"Upload Failed: {e}")
+                await main_app.send_message(chat_id, f"❌ Upload Failed: {e}")
+
+            # Cleanup
             for f in files + [zip_path]:
                 try: os.remove(f)
                 except: pass
@@ -300,13 +385,17 @@ async def manager_logic(chat_id):
     stop_event.set()
     await delete_job(chat_id)
     shutil.rmtree(user_dir, ignore_errors=True)
-    await main_app.send_message(chat_id, "✅ **Done.**")
+    await main_app.send_message(chat_id, "✅ **Mission Complete.**")
 
-# --- MAIN HANDLERS ---
+def zip_files(file_list, output_path):
+    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zipf:
+        for f in file_list:
+            if os.path.exists(f): zipf.write(f, os.path.basename(f))
+
+# --- HANDLERS ---
 
 @main_app.on_message(filters.command("start"))
 async def start(c, m):
-    print(f"✅ /start received from {m.chat.id}")
     if await get_job(m.chat.id):
         await m.reply_text("🔄 **Resuming...**")
         asyncio.create_task(manager_logic(m.chat.id))
@@ -315,7 +404,6 @@ async def start(c, m):
 
 @main_app.on_message(filters.regex(r"(?:t\.me|telegram\.me|telegram\.dog)/") & filters.private)
 async def step1(c, m):
-    print(f"✅ Link received: {m.text}")
     if await get_job(m.chat.id): return await m.reply_text("⚠️ Busy.")
     
     link = m.text.strip()
@@ -336,7 +424,6 @@ async def step1(c, m):
 
 @main_app.on_message(filters.text & filters.private & ~filters.regex(r"^/") & ~filters.regex(r"t\.me"))
 async def step2(c, m):
-    print(f"✅ Text received: {m.text}")
     state = setup_state.get(m.chat.id)
     if not state: return
 
@@ -354,12 +441,11 @@ async def step2(c, m):
         except: return await m.reply_text("❌ Number only.")
         await save_job(m.chat.id, state["target"], 1, state["end_id"], sz, state["naming"])
         del setup_state[m.chat.id]
-        await m.reply_text("🚀 **Unleashing the Swarm...**")
         asyncio.create_task(manager_logic(m.chat.id))
 
 if __name__ == "__main__":
     if not os.path.exists(WORK_DIR): os.makedirs(WORK_DIR)
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
-    print("🔥 Swarm Starting... (Logs will appear below)")
+    print("🔥 Swarm Starting...")
     compose(all_apps)
