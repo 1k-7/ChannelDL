@@ -12,7 +12,8 @@ from pyrogram.errors import (
     PeerIdInvalid, 
     ChannelInvalid, 
     FileReferenceExpired, 
-    AuthKeyUnregistered
+    AuthKeyUnregistered,
+    UserNotParticipant
 )
 from dotenv import load_dotenv
 
@@ -32,7 +33,6 @@ MAIN_BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WORKER_TOKENS_STR = os.getenv("WORKER_TOKENS", "")
 WORKER_TOKENS = [t.strip() for t in WORKER_TOKENS_STR.split(",") if t.strip()]
 
-# SAFETY CHECK
 if MAIN_BOT_TOKEN in WORKER_TOKENS:
     print("❌ FATAL: Main Bot Token is also in WORKER_TOKENS. Remove it.")
     exit(1)
@@ -47,7 +47,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("SwarmBot")
-# Reduce noise
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 if not os.path.exists(SESSION_DIR):
@@ -76,6 +75,7 @@ print(f"✅ Swarm Loaded: {len(all_apps)} Bots Total")
 setup_state = {}
 job_progress = {} 
 active_downloads = {} 
+stop_events = {} # Key: chat_id, Value: asyncio.Event
 
 # --- DATABASE ---
 
@@ -133,28 +133,50 @@ async def progress_callback(current, total, unique_id, chat_id):
         active_downloads[chat_id][unique_id] = current
 
 async def swarm_warmup(chat_id, target_channel):
+    """
+    Aggressively ensures workers have the Access Hash.
+    If direct access fails, scans dialogs to 'find' the channel.
+    """
     logger.info("🔥 Warming up workers...")
+    status_msg = await main_app.send_message(chat_id, "🛡 **Swarm Warmup: checking access...**")
+    
     success_count = 0
     
-    async def check_access(bot):
+    async def activate_bot(bot):
         try:
+            # 1. Direct Attempt
             await bot.get_chat(target_channel)
             return True
+        except (PeerIdInvalid, ChannelInvalid):
+            # 2. Peer Cache Miss - Scan Dialogs
+            # This forces the bot to 'see' the channel in its list and cache the hash
+            try:
+                # logger.info(f"{bot.name} scanning dialogs...")
+                async for dialog in bot.get_dialogs(limit=100):
+                    if dialog.chat.id == target_channel:
+                        return True
+            except Exception as e:
+                logger.warning(f"{bot.name} dialog scan failed: {e}")
+            return False
         except Exception as e:
-            logger.warning(f"⚠️ Worker {bot.name} cannot access channel: {e}")
+            logger.warning(f"{bot.name} error: {e}")
             return False
 
-    results = await asyncio.gather(*[check_access(bot) for bot in all_apps])
+    # Run checks in parallel
+    results = await asyncio.gather(*[activate_bot(bot) for bot in all_apps])
     success_count = sum(results)
     
-    await main_app.send_message(
-        chat_id, 
-        f"🛡 **Swarm Warmup:** {success_count}/{len(all_apps)} bots have access.\n"
-        f"Ensure all bots are admins/members of the channel."
-    )
+    msg_text = f"🛡 **Swarm Warmup:** {success_count}/{len(all_apps)} bots ready."
+    if success_count < len(all_apps):
+        msg_text += "\n⚠️ Some bots can't see the channel. Ensure they are members."
+    
+    await status_msg.edit_text(msg_text)
+    # Give it a second to settle
+    await asyncio.sleep(2)
+    await status_msg.delete()
 
 async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, progress_key):
-    """PRODUCER: Main Bot Scans History."""
+    """PRODUCER"""
     current = start_id
     batch_size = 200 
     
@@ -183,15 +205,16 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
     await queue.put(None)
 
 async def download_worker(client_inst, queue, chat_id, user_dir, semaphore, stop_event):
-    """CONSUMER: Worker Bots Download."""
+    """CONSUMER"""
     while not stop_event.is_set():
         try:
-            msg = await asyncio.wait_for(queue.get(), timeout=2.0)
+            # Short timeout allows checking stop_event regularly
+            msg = await asyncio.wait_for(queue.get(), timeout=1.0)
         except asyncio.TimeoutError:
             continue
         
         if msg is None:
-            await queue.put(None) # Signal others
+            await queue.put(None)
             break
 
         unique_id = f"{client_inst.name}_{msg.id}"
@@ -200,7 +223,7 @@ async def download_worker(client_inst, queue, chat_id, user_dir, semaphore, stop
             try:
                 active_downloads[chat_id][unique_id] = 0
                 
-                # --- DOWNLOAD ATTEMPT 1 ---
+                # --- DOWNLOAD LOGIC (With Refetch) ---
                 try:
                     f_path = await client_inst.download_media(
                         msg,
@@ -208,10 +231,8 @@ async def download_worker(client_inst, queue, chat_id, user_dir, semaphore, stop
                         progress=progress_callback,
                         progress_args=(unique_id, chat_id)
                     )
-                except FileReferenceExpired:
-                    # --- RECOVERY LOGIC ---
-                    # The worker needs its OWN reference. Fetch fresh.
-                    logger.info(f"{client_inst.name}: File Ref Expired for ID {msg.id}. Refetching...")
+                except (FileReferenceExpired, PeerIdInvalid):
+                    # Refetch with THIS client's session
                     fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
                     f_path = await client_inst.download_media(
                         fresh_msg,
@@ -233,14 +254,8 @@ async def download_worker(client_inst, queue, chat_id, user_dir, semaphore, stop
                     if unique_id in active_downloads[chat_id]:
                         del active_downloads[chat_id][unique_id]
 
-            except FloodWait as e:
-                logger.warning(f"{client_inst.name} Hit FloodWait: {e.value}s")
-                await asyncio.sleep(e.value + 1)
-                # Retry logic could be added here, but for now we might skip or fail
-                if unique_id in active_downloads[chat_id]: del active_downloads[chat_id][unique_id]
-
             except Exception as e:
-                logger.error(f"{client_inst.name} DL Fail {msg.id}: {e}")
+                logger.error(f"{client_inst.name} DL Fail: {e}")
                 if unique_id in active_downloads[chat_id]:
                     del active_downloads[chat_id][unique_id]
         
@@ -251,8 +266,6 @@ async def status_monitor(client, chat_id, stop_event):
     last_text = ""
     last_bytes_total = 0
     last_check_time = time.time()
-    
-    # Store previous speed to avoid flickering 0.00
     avg_speed = 0.0
 
     while not stop_event.is_set():
@@ -260,37 +273,31 @@ async def status_monitor(client, chat_id, stop_event):
             data = job_progress.get(chat_id)
             if not data: break
             
-            # 1. Calculate Total Processed (Disk + Network Buffer)
+            # Sum finished + live
             current_live = sum(active_downloads.get(chat_id, {}).values())
             total_now = data['finished_bytes'] + current_live
             
-            # 2. Time Delta
             now = time.time()
             time_diff = now - last_check_time
             
-            # 3. Calculate Speed every 2 seconds
             if time_diff >= 2.0:
                 bytes_diff = total_now - last_bytes_total
-                
-                # Prevent negative speed (rare race condition)
                 if bytes_diff < 0: bytes_diff = 0
                 
-                current_speed = (bytes_diff / time_diff) / (1024 * 1024) # MB/s
-                
-                # Simple Moving Average for smoothness
+                current_speed = (bytes_diff / time_diff) / (1024 * 1024)
                 avg_speed = (avg_speed * 0.7) + (current_speed * 0.3)
                 
                 last_bytes_total = total_now
                 last_check_time = now
 
-            # 4. Format Text
             text = (
                 f"🤖 **Swarm Active**\n"
                 f"⚡ Speed: `{avg_speed:.2f} MB/s` ({(avg_speed * 8):.0f} Mbps)\n"
                 f"📥 Queue: `{data['queue_obj'].qsize()}`\n"
                 f"💾 Chunk: `{(data['current_chunk_size'] + current_live)/1024/1024:.2f} MB`\n"
                 f"🔎 Scan: `{data['scanned']}` / `{data['total']}`\n"
-                f"📦 Part: `{data['part']}`"
+                f"📦 Part: `{data['part']}`\n"
+                f"🛑 /stop to cancel"
             )
 
             if text != last_text:
@@ -298,15 +305,18 @@ async def status_monitor(client, chat_id, stop_event):
                 last_text = text
             
             await asyncio.sleep(2)
-        except Exception as e:
-            logger.error(f"Monitor Error: {e}")
-            await asyncio.sleep(2)
+        except Exception:
+            pass
             
     await msg.delete()
 
 async def manager_logic(chat_id):
     job = await get_job(chat_id)
     if not job: return
+
+    # Register Stop Event
+    stop_event = asyncio.Event()
+    stop_events[chat_id] = stop_event
 
     await swarm_warmup(chat_id, job['target'])
 
@@ -315,7 +325,6 @@ async def manager_logic(chat_id):
     os.makedirs(user_dir, exist_ok=True)
     
     queue = asyncio.Queue(maxsize=1000)
-    stop_event = asyncio.Event()
     
     job_progress[chat_id] = {
         'scanned': job['last_id'], 'total': job['end_id'], 
@@ -325,28 +334,26 @@ async def manager_logic(chat_id):
     }
     active_downloads[chat_id] = {}
 
-    # Start Fetcher
     fetch_task = asyncio.create_task(
         fetch_worker(main_app, job['target'], job['last_id'], job['end_id'], queue, stop_event, chat_id)
     )
 
-    # Start Downloaders (10 concurrent per bot)
     semaphores = [asyncio.Semaphore(10) for _ in all_apps]
     for i, app_inst in enumerate(all_apps):
         asyncio.create_task(download_worker(app_inst, queue, chat_id, user_dir, semaphores[i], stop_event))
 
-    # Start Monitor
     asyncio.create_task(status_monitor(main_app, chat_id, stop_event))
 
+    # Monitor Loop
     while not stop_event.is_set():
         await asyncio.sleep(2)
         
         is_full = job_progress[chat_id]['current_chunk_size'] >= job['max_size']
         is_finished = fetch_task.done() and queue.empty() and not active_downloads.get(chat_id)
         
+        # Trigger Zip
         if is_full or (is_finished and job_progress[chat_id]['files']):
             files = list(job_progress[chat_id]['files'])
-            # Clear buffer immediately to prevent double zipping
             job_progress[chat_id]['files'] = []
             job_progress[chat_id]['current_chunk_size'] = 0
             
@@ -356,7 +363,6 @@ async def manager_logic(chat_id):
             
             await main_app.send_message(chat_id, f"🤐 **Zipping {zip_name}...**")
             
-            # Zip in thread
             await asyncio.to_thread(zip_files, files, zip_path)
             
             end_id = job_progress[chat_id]['highest_id']
@@ -367,25 +373,23 @@ async def manager_logic(chat_id):
                     caption=f"🗂 **{zip_name}**\nUP TO ID: {end_id}"
                 )
                 
-                # Update DB only on success
+                # Checkpoint
                 job_progress[chat_id]['part'] += 1
                 await update_checkpoint(chat_id, end_id, job_progress[chat_id]['part'])
-                
             except Exception as e:
-                logger.error(f"Upload Failed: {e}")
                 await main_app.send_message(chat_id, f"❌ Upload Failed: {e}")
 
-            # Cleanup
             for f in files + [zip_path]:
                 try: os.remove(f)
                 except: pass
 
         if is_finished: break
 
-    stop_event.set()
+    # Cleanup
+    if chat_id in stop_events: del stop_events[chat_id]
     await delete_job(chat_id)
     shutil.rmtree(user_dir, ignore_errors=True)
-    await main_app.send_message(chat_id, "✅ **Mission Complete.**")
+    await main_app.send_message(chat_id, "✅ **Process Finished/Stopped.**")
 
 def zip_files(file_list, output_path):
     with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zipf:
@@ -393,6 +397,14 @@ def zip_files(file_list, output_path):
             if os.path.exists(f): zipf.write(f, os.path.basename(f))
 
 # --- HANDLERS ---
+
+@main_app.on_message(filters.command("stop"))
+async def stop_command(c, m):
+    if m.chat.id in stop_events:
+        stop_events[m.chat.id].set()
+        await m.reply_text("🛑 **Stopping Swarm...** (This may take a few seconds)")
+    else:
+        await m.reply_text("⚠️ No active process found.")
 
 @main_app.on_message(filters.command("start"))
 async def start(c, m):
