@@ -212,7 +212,7 @@ async def link_receiver(c, m):
         "*(Example: Send `1900` for 1.9GB chunks)*"
     )
 
-@app.on_message(filters.text & filters.private & ~filters.command & ~filters.regex(r"t\.me/"))
+@app.on_message(filters.text & filters.private & ~filters.regex(r"^/") & ~filters.regex(r"t\.me/"))
 async def size_receiver(c, m):
     # Check if we are waiting for a size from this user
     state = setup_state.get(m.chat.id)
