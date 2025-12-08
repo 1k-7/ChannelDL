@@ -3,12 +3,13 @@ version: '3.8'
 services:
   zipper-bot:
     build: .
-    restart: always
     container_name: fast_zipper
+    restart: always
+    environment:
+      - PYTHONUNBUFFERED=1  # Shows logs immediately
     env_file:
       - .env
     volumes:
       - ./zipper_state.db:/app/zipper_state.db
       - ./downloads:/app/downloads
-      # THIS LINE FIXES THE "NOT ADMIN" / RE-LOGIN ISSUE
-      - ./sessions:/app/sessions
+      - ./sessions:/app/sessions  # CRITICAL: Fixes "Not Admin" / Login loss
