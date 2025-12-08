@@ -5,6 +5,7 @@ import zipfile
 import shutil
 import re
 import aiosqlite
+import time
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message
@@ -18,19 +19,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WORK_DIR = os.getenv("WORK_DIR", "downloads")
 DB_NAME = "zipper_state.db"
 
-# Performance Tuning
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(5)  # Concurrent downloads
-QUEUE_MAX_SIZE = 1000  # Buffer size for the fetcher
+# Tuning
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(5)  # 5 Concurrent downloads
+QUEUE_MAX_SIZE = 500  # Keep buffer reasonable
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize Client
 app = Client("zipper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# In-Memory Setup State
 setup_state = {}
+# Global tracking for UI updates (chat_id -> dict)
+job_progress = {} 
 
 # --- DATABASE ---
 
@@ -69,7 +70,6 @@ async def save_job(chat_id, target, last_id, end_id, max_size, naming):
         await db.commit()
 
 async def update_checkpoint(chat_id, last_processed_id, next_part_num):
-    """Updates the 'Safe' ID after a successful upload."""
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
             "UPDATE jobs SET last_processed_id = ?, part_count = ? WHERE chat_id = ?",
@@ -82,142 +82,168 @@ async def delete_job(chat_id):
         await db.execute("DELETE FROM jobs WHERE chat_id = ?", (chat_id,))
         await db.commit()
 
-# --- WORKER LOGIC ---
+# --- WORKER PIPELINE ---
 
-async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event):
-    """Producer: Fetches messages in batches and feeds the queue."""
+async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, progress_key):
+    """
+    PRODUCER: Scans message history in batches of 200 (API Limit)
+    and pushes valid media messages to the Queue.
+    """
     current = start_id
-    batch_size = 200 # Pyrogram Limit
+    batch_size = 200 
     
     while current <= end_id and not stop_event.is_set():
         batch_end = min(current + batch_size, end_id + 1)
         ids = list(range(current, batch_end))
         
         try:
-            # Efficient fetching from Reference Repo
+            # Update 'Scanned' status for UI
+            if progress_key in job_progress:
+                job_progress[progress_key]['scanned'] = current
+
             messages = await client.get_messages(target_chat, ids)
             
-            # Put VALID media messages into queue
             for msg in messages:
                 if msg and (msg.document or msg.video or msg.audio or msg.photo):
-                    await queue.put(msg)
+                    await queue.put(msg) # Blocks if queue is full (Backpressure)
             
             current = batch_end
             
         except FloodWait as e:
-            logger.warning(f"FloodWait: Sleeping {e.value}s")
             await asyncio.sleep(e.value)
         except Exception as e:
-            logger.error(f"Fetch Error at {current}: {e}")
-            await asyncio.sleep(2) # Brief pause on error
+            logger.error(f"Fetch Error: {e}")
+            await asyncio.sleep(2)
             
-    # Signal end of fetching
-    await queue.put(None)
+    await queue.put(None) # Sentinel to signal end
+
+async def status_updater(client, chat_id, stop_event):
+    """Updates the user message every 5 seconds to show live stats."""
+    msg = await client.send_message(chat_id, "⏳ **Initializing Pipeline...**")
+    last_text = ""
+    
+    while not stop_event.is_set():
+        try:
+            data = job_progress.get(chat_id)
+            if not data: break
+
+            text = (
+                f"🚀 **Job Running**\n"
+                f"🔎 Scanned ID: `{data['scanned']}` / `{data['total']}`\n"
+                f"📥 Queue Buffer: `{data['queue_size']}`\n"
+                f"💾 Current Chunk: `{data['current_size']/1024/1024:.2f} MB`\n"
+                f"📦 Part: `{data['part']}`"
+            )
+            
+            if text != last_text:
+                await msg.edit_text(text)
+                last_text = text
+            
+            await asyncio.sleep(4)
+        except Exception:
+            pass
+    
+    await msg.delete()
 
 async def download_manager(client, chat_id):
     job = await get_job(chat_id)
     if not job: return
 
-    # Setup
     user_dir = os.path.join(WORK_DIR, str(chat_id))
-    if os.path.exists(user_dir): shutil.rmtree(user_dir) # Clean start for safety
+    if os.path.exists(user_dir): shutil.rmtree(user_dir)
     os.makedirs(user_dir, exist_ok=True)
     
     queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
     stop_event = asyncio.Event()
     
-    # Start Producer (Fetcher)
-    fetch_task = asyncio.create_task(
-        fetch_worker(client, job['target'], job['last_id'], job['end_id'], queue, stop_event)
-    )
+    # Init Progress Tracking
+    job_progress[chat_id] = {
+        'scanned': job['last_id'], 
+        'total': job['end_id'], 
+        'queue_size': 0, 
+        'current_size': 0,
+        'part': job['part']
+    }
 
-    # State Tracking
-    current_size = 0
+    # Start Workers
+    fetch_task = asyncio.create_task(
+        fetch_worker(client, job['target'], job['last_id'], job['end_id'], queue, stop_event, chat_id)
+    )
+    ui_task = asyncio.create_task(status_updater(client, chat_id, stop_event))
+
+    current_chunk_size = 0
     batch_highest_id = job['last_id']
     files_in_batch = []
     
-    status_msg = await client.send_message(
-        chat_id, 
-        f"🚀 **Starting Pipeline**\n"
-        f"Fetching: `{job['last_id']}` -> `{job['end_id']}`\n"
-        f"Concurrent Downloads: {DOWNLOAD_SEMAPHORE._value}"
-    )
-
+    # CONSUMER LOOP
     while True:
-        # Get message from queue
-        msg = await queue.get()
+        # Update Queue Size for UI
+        job_progress[chat_id]['queue_size'] = queue.qsize()
         
-        # None means Producer is done
-        if msg is None:
-            break
+        msg = await queue.get()
+        if msg is None: break # End of Fetching
 
-        # Download Task
         async with DOWNLOAD_SEMAPHORE:
             try:
-                # Download
                 f_path = await client.download_media(msg, file_name=os.path.join(user_dir, ""))
                 
                 if f_path:
                     f_size = os.path.getsize(f_path)
-                    current_size += f_size
+                    current_chunk_size += f_size
                     files_in_batch.append(f_path)
                     
-                    # Track highest ID in this current batch of files
-                    if msg.id > batch_highest_id:
-                        batch_highest_id = msg.id
+                    if msg.id > batch_highest_id: batch_highest_id = msg.id
+                    
+                    # Update UI Data
+                    job_progress[chat_id]['current_size'] = current_chunk_size
 
-                    # --- ZIP TRIGGER ---
-                    if current_size >= job['max_size']:
-                        await status_msg.edit_text(f"📦 **Zipping Part {job['part']}...**\nSize: {current_size/1024/1024:.2f} MB")
-                        
+                    # --- ZIP CHECK ---
+                    if current_chunk_size >= job['max_size']:
                         # Generate Name
                         zip_name_fmt = job['naming'].format(job['part'])
                         if not zip_name_fmt.endswith(".zip"): zip_name_fmt += ".zip"
                         zip_path = os.path.join(user_dir, zip_name_fmt)
-
-                        # Zip
+                        
+                        # Notify (Override Status Updater briefly)
+                        await client.send_message(chat_id, f"🤐 **Zipping {zip_name_fmt}...**")
+                        
                         await asyncio.to_thread(zip_files, files_in_batch, zip_path)
+                        await client.send_document(chat_id, zip_path, caption=f"🗂 **{zip_name_fmt}**\nEnd ID: {batch_highest_id}")
                         
-                        # Upload
-                        await status_msg.edit_text(f"⬆️ **Uploading {zip_name_fmt}...**")
-                        await client.send_document(chat_id, zip_path, caption=f"🗂 **{zip_name_fmt}**\nUp to ID: {batch_highest_id}")
-                        
-                        # Checkpoint & Cleanup
+                        # Cleanup
                         job['part'] += 1
+                        job_progress[chat_id]['part'] = job['part']
+                        
                         await update_checkpoint(chat_id, batch_highest_id, job['part'])
                         
-                        # Cleanup disk
                         for f in files_in_batch:
                             try: os.remove(f)
                             except: pass
-                        os.remove(zip_path)
+                        try: os.remove(zip_path)
+                        except: pass
                         
-                        # Reset Batch State
                         files_in_batch = []
-                        current_size = 0
-                        
-                        await status_msg.edit_text(f"📥 **Resuming Downloads...**")
+                        current_chunk_size = 0
 
             except Exception as e:
-                logger.error(f"Download fail: {e}")
+                logger.error(f"DL Error: {e}")
         
         queue.task_done()
 
-    # --- FINAL BATCH ---
+    # FINAL BATCH
     if files_in_batch:
-        await status_msg.edit_text("📦 **Zipping Final Part...**")
         zip_name_fmt = job['naming'].format(job['part'])
         if not zip_name_fmt.endswith(".zip"): zip_name_fmt += ".zip"
         zip_path = os.path.join(user_dir, zip_name_fmt)
 
         await asyncio.to_thread(zip_files, files_in_batch, zip_path)
-        await client.send_document(chat_id, zip_path, caption=f"🏁 **Final Part: {zip_name_fmt}**\nJob Complete.")
-    
-    # Finish
+        await client.send_document(chat_id, zip_path, caption=f"🏁 **Final: {zip_name_fmt}**")
+
     stop_event.set()
     await delete_job(chat_id)
+    if chat_id in job_progress: del job_progress[chat_id]
     shutil.rmtree(user_dir, ignore_errors=True)
-    await status_msg.edit_text("✅ **All Done.**")
+    await client.send_message(chat_id, "✅ **Job Complete.**")
 
 def zip_files(file_list, output_path):
     with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zipf:
@@ -229,84 +255,60 @@ def zip_files(file_list, output_path):
 
 @app.on_message(filters.command("start"))
 async def start(c, m):
-    # Check for resumption
     if await get_job(m.chat.id):
         await m.reply_text("🔄 **Resuming previous job...**")
         asyncio.create_task(download_manager(c, m.chat.id))
     else:
-        await m.reply_text(
-            "👋 **Advanced Channel Zipper**\n"
-            "1. Send me the **Link** of the last message.\n"
-            "2. I'll ask for a naming format (e.g., `Backup-Part {}`).\n"
-            "3. I'll ask for the max zip size."
-        )
+        await m.reply_text("👋 **Send Channel Link (Last Message).**")
 
 @app.on_message(filters.regex(r"t\.me/") & filters.private)
 async def step1_link(c, m):
-    if await get_job(m.chat.id): return await m.reply_text("⚠️ Job already running.")
-
-    # Extract ID
+    if await get_job(m.chat.id): return await m.reply_text("⚠️ Job Running.")
+    
     link = m.text.strip()
-    target_id = None
-    end_id = None
+    target_id, end_id = None, None
 
-    if "t.me/c/" in link: # Private
+    if "t.me/c/" in link:
         match = re.search(r"t\.me/c/(\d+)/(\d+)", link)
         if match: target_id, end_id = int("-100" + match.group(1)), int(match.group(2))
-    else: # Public
+    else:
         match = re.search(r"t\.me/([^/]+)/(\d+)", link)
         if match: target_id, end_id = match.group(1), int(match.group(2))
 
     if not target_id: return await m.reply_text("❌ Invalid Link.")
-
-    # Resolve Peer Check
-    msg = await m.reply_text("🔎 **Verifying Channel Access...**")
-    try:
-        await c.get_chat(target_id)
-    except Exception as e:
-        return await msg.edit_text(f"❌ **Error:** I cannot access that channel.\nAre you sure I am a member/admin?\n`{e}`")
+    
+    # Verify Access
+    try: await c.get_chat(target_id)
+    except: return await m.reply_text("❌ **Access Denied.** Make me admin?")
 
     setup_state[m.chat.id] = {"step": "name", "target": target_id, "end_id": end_id}
-    await msg.edit_text(
-        "✅ **Link Accepted.**\n\n"
-        "🔡 **Enter Naming Format:**\n"
-        "Use `{}` where the number should go.\n"
-        "Example: `FansMTL-Part {}`\n"
-        "Reply `default` for `Batch_{}`."
-    )
+    await m.reply_text("✅ **Link OK.**\n\nEnter Naming Format (e.g. `MyPack-{}`).\nReply `default` for standard.")
 
 @app.on_message(filters.text & filters.private & ~filters.regex(r"^/") & ~filters.regex(r"t\.me/"))
 async def step_handler(c, m):
     state = setup_state.get(m.chat.id)
     if not state: return
 
-    # Step 2: Naming Scheme
     if state["step"] == "name":
-        name_input = m.text.strip()
-        if name_input.lower() == "default": name_input = "Batch_{}"
-        if "{}" not in name_input: name_input += "_{}" # Ensure valid format
+        name = m.text.strip()
+        if name.lower() == "default": name = "Batch_{}"
+        if "{}" not in name: name += "_{}"
         
-        state["naming"] = name_input
+        state["naming"] = name
         state["step"] = "size"
         setup_state[m.chat.id] = state
-        
-        await m.reply_text("📦 **Enter Max Zip Size (in MB):**\nExample: `1900`")
+        await m.reply_text("📦 **Enter Max Zip Size (MB):**\nExample: `1900`")
 
-    # Step 3: Size & Launch
     elif state["step"] == "size":
         try:
             size_mb = int(m.text.strip())
             if not (10 <= size_mb <= 2000): raise ValueError
-        except:
-            return await m.reply_text("❌ Invalid size. Enter a number between 10 and 2000.")
+        except: return await m.reply_text("❌ Enter number 10-2000.")
 
-        await m.reply_text(f"🚀 **Starting Job!**\nName: `{state['naming']}`\nSize: `{size_mb} MB`")
-        
-        await save_job(
-            m.chat.id, state["target"], 1, state["end_id"], 
-            size_mb * 1024 * 1024, state["naming"]
-        )
+        await save_job(m.chat.id, state["target"], 1, state["end_id"], size_mb * 1024 * 1024, state["naming"])
         del setup_state[m.chat.id]
+        
+        await m.reply_text(f"🚀 **Starting Pipeline...**")
         asyncio.create_task(download_manager(c, m.chat.id))
 
 if __name__ == "__main__":
