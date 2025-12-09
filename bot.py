@@ -216,6 +216,7 @@ async def swarm_warmup(chat_id, target_channel):
     await status_msg.delete()
 
 async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, progress_key):
+    """PRODUCER"""
     current = start_id
     batch_size = 200 
     
@@ -357,7 +358,11 @@ async def status_monitor(client, chat_id, stop_event):
                 await msg.edit_text(text)
                 last_text = text
             
-            await asyncio.sleep(2)
+            # --- INCREASED DELAY TO 30 SECONDS ---
+            await asyncio.sleep(30)
+            
+        except FloodWait as e:
+             await asyncio.sleep(e.value + 5)
         except Exception:
             pass
     await msg.delete()
@@ -392,11 +397,14 @@ async def zip_and_send(chat_id, files, job, user_dir):
     if not zip_name.endswith(".zip"): zip_name += ".zip"
     zip_path = os.path.join(user_dir, zip_name)
     
-    await main_app.send_message(chat_id, f"🤐 **Zipping {zip_name}...** ({len(files)} files)")
+    # Send a new message instead of editing status to avoid conflicts
+    status = await main_app.send_message(chat_id, f"🤐 **Zipping {zip_name}...** ({len(files)} files)")
     
     try:
         await asyncio.to_thread(zip_files, files, zip_path)
+        await status.edit_text(f"⬆️ **Uploading {zip_name}...**")
         await main_app.send_document(chat_id, zip_path, caption=f"🗂 **{zip_name}**")
+        await status.delete()
         
         job_progress[chat_id]['part'] += 1
         await update_checkpoint(chat_id, job_progress[chat_id]['highest_id'], job_progress[chat_id]['part'])
@@ -494,7 +502,6 @@ async def step1(c, m):
     except: return await m.reply_text("❌ **Main Bot** cannot access channel.")
     
     setup_state[m.chat.id] = {"step": "name", "target": target_id, "last_id": start_id, "end_id": end_id}
-    # FIXED SYNTAX ERROR HERE (Escaped curly braces for Pack-{})
     await m.reply_text(f"✅ **Link OK.**\nRange: `{start_id}` -> `{end_id}`\nEnter Naming (e.g. `Pack-{{}}`) or `default`.")
 
 @main_app.on_message(filters.text & filters.private & ~filters.regex(r"^/") & ~filters.regex(r"t\.me"))
