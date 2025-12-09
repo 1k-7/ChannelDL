@@ -152,37 +152,24 @@ async def delete_job(chat_id):
 
 # --- HELPER: LINK PARSER ---
 def parse_link(link):
-    """
-    Parses Telegram links to extract Chat ID and Range.
-    Supports:
-    - https://t.me/c/12345/100 (Start=1, End=100)
-    - https://t.me/c/12345/50-100 (Start=50, End=100)
-    - https://t.me/username/100
-    - https://t.me/username/50-100
-    """
     link = link.strip()
     target_id = None
     start_id = 1
     end_id = None
 
-    # Check for Private Channel (t.me/c/...)
     if "t.me/c/" in link:
-        # Regex for ID and (Range or Single Msg)
         match = re.search(r"t\.me/c/(\d+)/([\d\-]+)", link)
         if match:
             target_id = int("-100" + match.group(1))
             msg_part = match.group(2)
-    
-    # Check for Public Username
     elif "t.me/" in link:
         match = re.search(r"t\.me/([^/]+)/([\d\-]+)", link)
         if match:
-            target_id = match.group(1) # Username string
+            target_id = match.group(1) 
             msg_part = match.group(2)
     
     if target_id and msg_part:
         if "-" in msg_part:
-            # Range detected: 50-100
             try:
                 parts = msg_part.split("-")
                 start_id = int(parts[0])
@@ -190,10 +177,8 @@ def parse_link(link):
             except ValueError:
                 return None, None, None
         else:
-            # Single ID: 100 (Start defaults to 1)
             end_id = int(msg_part)
             start_id = 1
-
         return target_id, start_id, end_id
 
     return None, None, None
@@ -231,7 +216,6 @@ async def swarm_warmup(chat_id, target_channel):
     await status_msg.delete()
 
 async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, progress_key):
-    """PRODUCER"""
     current = start_id
     batch_size = 200 
     
@@ -260,7 +244,7 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
     await queue.put(None)
 
 def calculate_cost(msg):
-    return 1 
+    return 1
 
 async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost, unique_id):
     try:
@@ -285,7 +269,6 @@ async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost,
                 progress=progress_callback,
                 progress_args=(unique_id, chat_id)
             )
-        # Fix: Catch standard ConnectionError instead of importing it
         except ConnectionError:
              logger.warning(f"{client_inst.name} lost connection, retrying...")
              await asyncio.sleep(1)
@@ -507,13 +490,12 @@ async def step1(c, m):
     target_id, start_id, end_id = parse_link(m.text)
 
     if not target_id: return await m.reply_text("❌ Bad Link.")
-    
-    # Check access
     try: await c.get_chat(target_id)
     except: return await m.reply_text("❌ **Main Bot** cannot access channel.")
     
     setup_state[m.chat.id] = {"step": "name", "target": target_id, "last_id": start_id, "end_id": end_id}
-    await m.reply_text(f"✅ **Link OK.**\nRange: `{start_id}` -> `{end_id}`\nEnter Naming (e.g. `Pack-{}`) or `default`.")
+    # FIXED SYNTAX ERROR HERE (Escaped curly braces for Pack-{})
+    await m.reply_text(f"✅ **Link OK.**\nRange: `{start_id}` -> `{end_id}`\nEnter Naming (e.g. `Pack-{{}}`) or `default`.")
 
 @main_app.on_message(filters.text & filters.private & ~filters.regex(r"^/") & ~filters.regex(r"t\.me"))
 async def step2(c, m):
