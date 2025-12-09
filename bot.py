@@ -13,16 +13,19 @@ from pyrogram.errors import (
     ChannelInvalid, 
     FileReferenceExpired, 
     AuthKeyUnregistered,
-    UserNotParticipant
+    ConnectionError
 )
 from dotenv import load_dotenv
 
-# --- SAFE IMPORTS ---
+# --- CRITICAL PERFORMANCE MODULES ---
 try:
     import uvloop
     uvloop.install()
+    import tgcrypto
 except ImportError:
-    pass
+    print("❌ FATAL: High Speed requires 'uvloop' and 'tgcrypto'.")
+    print("   pip install uvloop tgcrypto")
+    exit(1)
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -41,26 +44,21 @@ WORK_DIR = os.getenv("WORK_DIR", "downloads")
 DB_NAME = "zipper_state.db"
 SESSION_DIR = "sessions"
 
-# --- TUNING ---
-# 100 = 100 Concurrent files per bot
-BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 100))
-QUEUE_MAX_SIZE = 5000 
-
-# Telegram Hard Limit (1.9GB to be safe)
+# --- TUNING FOR 500MBPS+ ---
+# 300 concurrent files per bot to saturate Gigabit
+BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 300))
+QUEUE_MAX_SIZE = 10000 
 TG_MAX_FILE_SIZE = 1900 * 1024 * 1024 
 
 # Logging
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SwarmBot")
-logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logging.getLogger("pyrogram").setLevel(logging.ERROR) # Silence Pyrogram logs for speed
 
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR)
 
-# --- CUSTOM SEMAPHORE ---
+# --- LIGHTWEIGHT SEMAPHORE ---
 class WeightedSemaphore:
     def __init__(self, value=1):
         self._value = value
@@ -86,11 +84,12 @@ def create_client(name, token):
         bot_token=token,
         workdir=SESSION_DIR, 
         ipv6=False,
+        # Max out parallel connections
         max_concurrent_transmissions=256, 
         workers=32
     )
 
-print("🔥 Initializing Clients...")
+print("🔥 Initializing High-Performance Swarm...")
 main_app = create_client("main_bot", MAIN_BOT_TOKEN)
 worker_apps = [create_client(f"worker_{i+1}", t) for i, t in enumerate(WORKER_TOKENS)]
 all_apps = [main_app] + worker_apps
@@ -99,7 +98,6 @@ print(f"✅ Swarm Loaded: {len(all_apps)} Bots Total")
 # Global State
 setup_state = {}
 job_progress = {} 
-active_downloads = {} 
 stop_events = {}
 
 # --- DATABASE ---
@@ -150,7 +148,6 @@ async def delete_job(chat_id):
         await db.execute("DELETE FROM jobs WHERE chat_id = ?", (chat_id,))
         await db.commit()
 
-# --- HELPER: LINK PARSER ---
 def parse_link(link):
     link = link.strip()
     target_id = None
@@ -185,10 +182,6 @@ def parse_link(link):
 
 # --- WORKER LOGIC ---
 
-async def progress_callback(current, total, unique_id, chat_id):
-    if chat_id in active_downloads:
-        active_downloads[chat_id][unique_id] = current
-
 async def swarm_warmup(chat_id, target_channel):
     logger.info("🔥 Warming up workers...")
     status_msg = await main_app.send_message(chat_id, "🛡 **Swarm Warmup: checking access...**")
@@ -204,7 +197,6 @@ async def swarm_warmup(chat_id, target_channel):
             except: pass
             return False
         except Exception as e:
-            logger.warning(f"{bot.name} error: {e}")
             return False
 
     results = await asyncio.gather(*[activate_bot(bot) for bot in all_apps])
@@ -238,47 +230,43 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
             
         except FloodWait as e:
             await asyncio.sleep(e.value)
-        except Exception as e:
-            logger.error(f"Fetch Error: {e}")
+        except Exception:
             await asyncio.sleep(2)
             
     await queue.put(None)
 
 def calculate_cost(msg):
-    return 1
+    return 1 # Maximum concurrency mode
 
-async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost, unique_id):
+async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost):
     try:
-        active_downloads[chat_id][unique_id] = 0
-        
+        # Increment Active Count
+        if chat_id in job_progress:
+            job_progress[chat_id]['active_count'] += 1
+
         if not client_inst.is_connected:
              try: await client_inst.connect()
              except: pass
 
+        f_path = None
         try:
+            # NO PROGRESS CALLBACK (Saves CPU)
             f_path = await client_inst.download_media(
                 msg,
-                file_name=os.path.join(user_dir, ""),
-                progress=progress_callback,
-                progress_args=(unique_id, chat_id)
+                file_name=os.path.join(user_dir, "")
             )
         except (FileReferenceExpired, PeerIdInvalid):
             fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
             f_path = await client_inst.download_media(
                 fresh_msg,
-                file_name=os.path.join(user_dir, ""),
-                progress=progress_callback,
-                progress_args=(unique_id, chat_id)
+                file_name=os.path.join(user_dir, "")
             )
         except ConnectionError:
-             logger.warning(f"{client_inst.name} lost connection, retrying...")
              await asyncio.sleep(1)
              fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
              f_path = await client_inst.download_media(
                 fresh_msg,
-                file_name=os.path.join(user_dir, ""),
-                progress=progress_callback,
-                progress_args=(unique_id, chat_id)
+                file_name=os.path.join(user_dir, "")
             )
 
         if f_path:
@@ -292,10 +280,10 @@ async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost,
                     job_progress[chat_id]['highest_id'] = msg.id
 
     except Exception as e:
-        logger.error(f"{client_inst.name} DL Fail: {e}")
+        logger.error(f"DL Fail: {e}")
     finally:
-        if unique_id in active_downloads[chat_id]:
-            del active_downloads[chat_id][unique_id]
+        if chat_id in job_progress:
+            job_progress[chat_id]['active_count'] -= 1
         await semaphore.release(cost)
 
 async def download_dispatcher(client_inst, queue, chat_id, user_dir, semaphore, stop_event):
@@ -309,73 +297,69 @@ async def download_dispatcher(client_inst, queue, chat_id, user_dir, semaphore, 
             await queue.put(None)
             break
 
-        unique_id = f"{client_inst.name}_{msg.id}"
         cost = calculate_cost(msg)
         await semaphore.acquire(cost)
         asyncio.create_task(
-            perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost, unique_id)
+            perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost)
         )
         queue.task_done()
 
 async def status_monitor(client, chat_id, stop_event):
     msg = await client.send_message(chat_id, "⏳ **Swarm Starting...**")
     last_text = ""
-    last_bytes_total = 0
-    last_check_time = time.time()
-    avg_speed = 0.0
+    last_bytes = 0
+    last_time = time.time()
 
     while not stop_event.is_set():
         try:
             data = job_progress.get(chat_id)
             if not data: break
             
-            current_live = sum(active_downloads.get(chat_id, {}).values())
-            total_now = data['finished_bytes'] + current_live
-            
+            # Speed Calculation based on FINISHED files only
             now = time.time()
-            time_diff = now - last_check_time
-            if time_diff >= 2.0:
-                bytes_diff = total_now - last_bytes_total
-                if bytes_diff < 0: bytes_diff = 0
-                current_speed = (bytes_diff / time_diff) / (1024 * 1024)
-                avg_speed = (avg_speed * 0.7) + (current_speed * 0.3)
-                last_bytes_total = total_now
-                last_check_time = now
+            total_now = data['finished_bytes']
+            
+            time_diff = now - last_time
+            if time_diff >= 5.0: # Check every 5 seconds
+                bytes_diff = total_now - last_bytes
+                speed = (bytes_diff / time_diff) / (1024 * 1024) # MB/s
+                last_bytes = total_now
+                last_time = now
+            else:
+                speed = getattr(status_monitor, "last_speed", 0.0)
+            
+            status_monitor.last_speed = speed
 
-            active_dls_count = len(active_downloads.get(chat_id, {}))
             text = (
-                f"🤖 **Swarm Active: {len(all_apps)} Bots**\n"
-                f"⚡ Speed: `{avg_speed:.2f} MB/s`\n"
+                f"🚀 **High-Speed Swarm**\n"
+                f"⚡ Speed: `{speed:.2f} MB/s` ({(speed * 8):.0f} Mbps)\n"
+                f"🔥 Active Streams: `{data['active_count']}`\n"
                 f"📥 Queue: `{data['queue_obj'].qsize()}`\n"
-                f"🔥 **Active DLs:** `{active_dls_count}`\n"
-                f"💾 Buffer: `{(data['current_chunk_size'])/1024/1024:.2f} MB`\n"
+                f"💾 Chunk: `{(data['current_chunk_size'])/1024/1024:.2f} MB`\n"
                 f"🔎 Scan: `{data['scanned']}` / `{data['total']}`\n"
                 f"📦 Part: `{data['part']}`\n"
-                f"🛑 /stop to cancel"
             )
 
             if text != last_text:
                 await msg.edit_text(text)
                 last_text = text
             
-            # --- INCREASED DELAY TO 30 SECONDS ---
-            await asyncio.sleep(30)
-            
+            # 20s Update Interval to prevent FloodWait
+            await asyncio.sleep(20)
         except FloodWait as e:
-             await asyncio.sleep(e.value + 5)
+            await asyncio.sleep(e.value + 5)
         except Exception:
             pass
     await msg.delete()
 
-# --- SMART SPLIT & UPLOAD LOGIC ---
+# --- SMART SPLIT & UPLOAD ---
 async def process_and_upload(chat_id, all_files, job, user_dir):
     chunk_files = []
     chunk_size = 0
     files_to_process = list(all_files)
     
     for file_path in files_to_process:
-        try:
-            f_size = os.path.getsize(file_path)
+        try: f_size = os.path.getsize(file_path)
         except: continue
 
         if chunk_size + f_size > TG_MAX_FILE_SIZE:
@@ -397,7 +381,6 @@ async def zip_and_send(chat_id, files, job, user_dir):
     if not zip_name.endswith(".zip"): zip_name += ".zip"
     zip_path = os.path.join(user_dir, zip_name)
     
-    # Send a new message instead of editing status to avoid conflicts
     status = await main_app.send_message(chat_id, f"🤐 **Zipping {zip_name}...** ({len(files)} files)")
     
     try:
@@ -435,9 +418,9 @@ async def manager_logic(chat_id):
         'scanned': job['last_id'], 'total': job['end_id'], 
         'current_chunk_size': 0, 'part': job['part'],
         'finished_bytes': 0, 'highest_id': job['last_id'],
+        'active_count': 0, # Simple integer counter
         'files': [], 'queue_obj': queue
     }
-    active_downloads[chat_id] = {}
 
     fetch_task = asyncio.create_task(
         fetch_worker(main_app, job['target'], job['last_id'], job['end_id'], queue, stop_event, chat_id)
@@ -453,7 +436,7 @@ async def manager_logic(chat_id):
         await asyncio.sleep(2)
         
         is_full = job_progress[chat_id]['current_chunk_size'] >= job['max_size']
-        is_finished = fetch_task.done() and queue.empty() and not active_downloads.get(chat_id)
+        is_finished = fetch_task.done() and queue.empty() and job_progress[chat_id]['active_count'] == 0
         
         if is_full or (is_finished and job_progress[chat_id]['files']):
             files_snapshot = list(job_progress[chat_id]['files'])
@@ -502,6 +485,7 @@ async def step1(c, m):
     except: return await m.reply_text("❌ **Main Bot** cannot access channel.")
     
     setup_state[m.chat.id] = {"step": "name", "target": target_id, "last_id": start_id, "end_id": end_id}
+    # Double curly braces for f-string escaping
     await m.reply_text(f"✅ **Link OK.**\nRange: `{start_id}` -> `{end_id}`\nEnter Naming (e.g. `Pack-{{}}`) or `default`.")
 
 @main_app.on_message(filters.text & filters.private & ~filters.regex(r"^/") & ~filters.regex(r"t\.me"))
