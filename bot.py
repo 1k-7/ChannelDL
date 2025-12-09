@@ -6,6 +6,7 @@ import shutil
 import re
 import aiosqlite
 import time
+import traceback
 from pyrogram import Client, filters, compose
 from pyrogram.errors import (
     FloodWait, 
@@ -45,6 +46,7 @@ DB_NAME = "zipper_state.db"
 SESSION_DIR = "sessions"
 
 # --- TUNING ---
+# 300 Concurrent files per bot
 BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 300))
 QUEUE_MAX_SIZE = 10000 
 TG_MAX_FILE_SIZE = 1900 * 1024 * 1024 
@@ -57,7 +59,7 @@ logging.getLogger("pyrogram").setLevel(logging.ERROR)
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR)
 
-# --- SEMAPHORE ---
+# --- LIGHTWEIGHT SEMAPHORE ---
 class WeightedSemaphore:
     def __init__(self, value=1):
         self._value = value
@@ -75,7 +77,9 @@ class WeightedSemaphore:
             self._condition.notify_all()
 
 # --- CLIENT FACTORY ---
-def create_client(name, token=None, session=None):
+def create_client(name, token=None, session=None, is_manager=False):
+    # Manager gets fewer streams to stay responsive
+    concurrent = 64 if is_manager else 256
     return Client(
         name,
         api_id=API_ID,
@@ -84,17 +88,17 @@ def create_client(name, token=None, session=None):
         session_string=session,
         workdir=SESSION_DIR, 
         ipv6=False,
-        max_concurrent_transmissions=256, 
+        max_concurrent_transmissions=concurrent, 
         workers=32
     )
 
 print("🔥 Initializing Swarm...")
-main_app = create_client("main_bot", token=MAIN_BOT_TOKEN)
+main_app = create_client("main_bot", token=MAIN_BOT_TOKEN, is_manager=True)
 
 premium_app = None
 if SESSION_STRING:
     try:
-        premium_app = create_client("premium_uploader", session=SESSION_STRING)
+        premium_app = create_client("premium_uploader", session=SESSION_STRING, is_manager=True)
         print("💎 Premium Account Loaded!")
     except Exception as e:
         print(f"⚠️ Premium Error: {e}")
@@ -103,7 +107,7 @@ worker_apps = [create_client(f"worker_{i+1}", token=t) for i, t in enumerate(WOR
 all_apps = [main_app] + worker_apps
 if premium_app: all_apps.append(premium_app)
 
-print(f"✅ Swarm Ready: {len(worker_apps)} Workers")
+print(f"✅ Swarm Loaded: {len(worker_apps)} Workers")
 
 # Global State
 setup_state = {}
@@ -206,7 +210,7 @@ async def swarm_warmup(chat_id, target_channel):
     await status_msg.delete()
 
 async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, progress_key):
-    """PRODUCER - Fixed Infinite Loop Bug"""
+    """PRODUCER - FIXED INFINITE LOOP BUG"""
     current = start_id
     batch_size = 200 
     
@@ -220,23 +224,21 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
 
             messages = await client.get_messages(target_chat, ids)
             
-            count = 0
             for msg in messages:
                 if msg and (msg.document or msg.video or msg.audio or msg.photo):
                     await queue.put(msg)
-                    count += 1
             
-            print(f"🔎 Scanned {current}-{batch_end} | Found: {count}")
-            current = batch_end # Success: Advance
+            current = batch_end
             
         except FloodWait as e:
             print(f"⏳ Fetcher FloodWait: {e.value}s")
             await asyncio.sleep(e.value)
-            # Do NOT advance 'current', retry this batch
+            # Retry loop correctly for FloodWait
         except Exception as e:
             print(f"⚠️ Fetcher Error on {current}: {e}")
+            # CRITICAL FIX: Skip batch on error to avoid getting stuck
+            current = batch_end
             await asyncio.sleep(1)
-            current = batch_end # Skip this batch to prevent stuck loop
             
     await queue.put(None)
 
@@ -257,13 +259,13 @@ async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost)
         except (FileReferenceExpired, PeerIdInvalid):
             fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
             f_path = await client_inst.download_media(fresh_msg, file_name=os.path.join(user_dir, ""))
-        except ConnectionError:
+        except Exception:
+             # Silent retry logic
              await asyncio.sleep(1)
              try:
                  fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
                  f_path = await client_inst.download_media(fresh_msg, file_name=os.path.join(user_dir, ""))
              except: pass
-        except Exception: pass
 
         if f_path:
             f_size = os.path.getsize(f_path)
@@ -384,7 +386,7 @@ async def zip_and_send(chat_id, files, job, user_dir):
         
         if premium_app and BOT_USERNAME and premium_app.is_connected:
             try:
-                # 2-Hour Timeout for Upload
+                # 2-Hour Timeout Protection for Uploads
                 async def upload_task():
                     return await premium_app.send_document(
                         BOT_USERNAME, 
