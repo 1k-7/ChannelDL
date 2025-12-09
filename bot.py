@@ -13,8 +13,7 @@ from pyrogram.errors import (
     ChannelInvalid, 
     FileReferenceExpired, 
     AuthKeyUnregistered,
-    UserNotParticipant,
-    ConnectionError
+    UserNotParticipant
 )
 from dotenv import load_dotenv
 
@@ -87,7 +86,6 @@ def create_client(name, token):
         bot_token=token,
         workdir=SESSION_DIR, 
         ipv6=False,
-        # RESTORED TO MAX SPEED
         max_concurrent_transmissions=256, 
         workers=32
     )
@@ -152,6 +150,54 @@ async def delete_job(chat_id):
         await db.execute("DELETE FROM jobs WHERE chat_id = ?", (chat_id,))
         await db.commit()
 
+# --- HELPER: LINK PARSER ---
+def parse_link(link):
+    """
+    Parses Telegram links to extract Chat ID and Range.
+    Supports:
+    - https://t.me/c/12345/100 (Start=1, End=100)
+    - https://t.me/c/12345/50-100 (Start=50, End=100)
+    - https://t.me/username/100
+    - https://t.me/username/50-100
+    """
+    link = link.strip()
+    target_id = None
+    start_id = 1
+    end_id = None
+
+    # Check for Private Channel (t.me/c/...)
+    if "t.me/c/" in link:
+        # Regex for ID and (Range or Single Msg)
+        match = re.search(r"t\.me/c/(\d+)/([\d\-]+)", link)
+        if match:
+            target_id = int("-100" + match.group(1))
+            msg_part = match.group(2)
+    
+    # Check for Public Username
+    elif "t.me/" in link:
+        match = re.search(r"t\.me/([^/]+)/([\d\-]+)", link)
+        if match:
+            target_id = match.group(1) # Username string
+            msg_part = match.group(2)
+    
+    if target_id and msg_part:
+        if "-" in msg_part:
+            # Range detected: 50-100
+            try:
+                parts = msg_part.split("-")
+                start_id = int(parts[0])
+                end_id = int(parts[1])
+            except ValueError:
+                return None, None, None
+        else:
+            # Single ID: 100 (Start defaults to 1)
+            end_id = int(msg_part)
+            start_id = 1
+
+        return target_id, start_id, end_id
+
+    return None, None, None
+
 # --- WORKER LOGIC ---
 
 async def progress_callback(current, total, unique_id, chat_id):
@@ -214,13 +260,12 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
     await queue.put(None)
 
 def calculate_cost(msg):
-    return 1 # High Concurrency for small files
+    return 1 
 
 async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost, unique_id):
     try:
         active_downloads[chat_id][unique_id] = 0
         
-        # Ensure client is connected before downloading
         if not client_inst.is_connected:
              try: await client_inst.connect()
              except: pass
@@ -240,10 +285,10 @@ async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost,
                 progress=progress_callback,
                 progress_args=(unique_id, chat_id)
             )
+        # Fix: Catch standard ConnectionError instead of importing it
         except ConnectionError:
              logger.warning(f"{client_inst.name} lost connection, retrying...")
              await asyncio.sleep(1)
-             # Simple retry once
              fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
              f_path = await client_inst.download_media(
                 fresh_msg,
@@ -251,7 +296,6 @@ async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost,
                 progress=progress_callback,
                 progress_args=(unique_id, chat_id)
             )
-
 
         if f_path:
             f_size = os.path.getsize(f_path)
@@ -337,8 +381,6 @@ async def status_monitor(client, chat_id, stop_event):
 
 # --- SMART SPLIT & UPLOAD LOGIC ---
 async def process_and_upload(chat_id, all_files, job, user_dir):
-    """Splits huge list of files into 1.9GB chunks."""
-    
     chunk_files = []
     chunk_size = 0
     files_to_process = list(all_files)
@@ -348,7 +390,6 @@ async def process_and_upload(chat_id, all_files, job, user_dir):
             f_size = os.path.getsize(file_path)
         except: continue
 
-        # Split trigger
         if chunk_size + f_size > TG_MAX_FILE_SIZE:
             await zip_and_send(chat_id, chunk_files, job, user_dir)
             chunk_files = []
@@ -457,25 +498,22 @@ async def start(c, m):
         await m.reply_text("🔄 **Resuming...**")
         asyncio.create_task(manager_logic(m.chat.id))
     else:
-        await m.reply_text(f"🤖 **Swarm Ready.**\nWorkers: {len(worker_apps)}\nSend **Last Link** to start.")
+        await m.reply_text(f"🤖 **Swarm Ready.**\nWorkers: {len(worker_apps)}\nSend **Link** to start.")
 
 @main_app.on_message(filters.regex(r"(?:t\.me|telegram\.me|telegram\.dog)/") & filters.private)
 async def step1(c, m):
     if await get_job(m.chat.id): return await m.reply_text("⚠️ Busy.")
-    link = m.text.strip()
-    target_id, end_id = None, None
-    if "t.me/c/" in link:
-        match = re.search(r"t\.me/c/(\d+)/(\d+)", link)
-        if match: target_id, end_id = int("-100" + match.group(1)), int(match.group(2))
-    else:
-        match = re.search(r"t\.me/([^/]+)/(\d+)", link)
-        if match: target_id, end_id = match.group(1), int(match.group(2))
+    
+    target_id, start_id, end_id = parse_link(m.text)
 
     if not target_id: return await m.reply_text("❌ Bad Link.")
+    
+    # Check access
     try: await c.get_chat(target_id)
     except: return await m.reply_text("❌ **Main Bot** cannot access channel.")
-    setup_state[m.chat.id] = {"step": "name", "target": target_id, "end_id": end_id}
-    await m.reply_text("✅ **Link OK.**\nEnter Naming (e.g. `Pack-{}`) or `default`.")
+    
+    setup_state[m.chat.id] = {"step": "name", "target": target_id, "last_id": start_id, "end_id": end_id}
+    await m.reply_text(f"✅ **Link OK.**\nRange: `{start_id}` -> `{end_id}`\nEnter Naming (e.g. `Pack-{}`) or `default`.")
 
 @main_app.on_message(filters.text & filters.private & ~filters.regex(r"^/") & ~filters.regex(r"t\.me"))
 async def step2(c, m):
@@ -492,7 +530,7 @@ async def step2(c, m):
     elif state["step"] == "size":
         try: sz = int(m.text.strip()) * 1024 * 1024
         except: return await m.reply_text("❌ Number only.")
-        await save_job(m.chat.id, state["target"], 1, state["end_id"], sz, state["naming"])
+        await save_job(m.chat.id, state["target"], state["last_id"], state["end_id"], sz, state["naming"])
         del setup_state[m.chat.id]
         asyncio.create_task(manager_logic(m.chat.id))
 
