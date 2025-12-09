@@ -13,7 +13,8 @@ from pyrogram.errors import (
     ChannelInvalid, 
     FileReferenceExpired, 
     AuthKeyUnregistered,
-    UserNotParticipant
+    UserNotParticipant,
+    ConnectionError
 )
 from dotenv import load_dotenv
 
@@ -41,12 +42,13 @@ WORK_DIR = os.getenv("WORK_DIR", "downloads")
 DB_NAME = "zipper_state.db"
 SESSION_DIR = "sessions"
 
-# --- SMART CONCURRENCY SETTINGS ---
-# Budget per bot. 
-# Small file cost = 1.
-# 200 = 200 concurrent small files PER BOT.
-BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 200))
-QUEUE_MAX_SIZE = 5000 # Increased buffer
+# --- TUNING ---
+# 100 = 100 Concurrent files per bot
+BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 100))
+QUEUE_MAX_SIZE = 5000 
+
+# Telegram Hard Limit (1.9GB to be safe)
+TG_MAX_FILE_SIZE = 1900 * 1024 * 1024 
 
 # Logging
 logging.basicConfig(
@@ -85,7 +87,7 @@ def create_client(name, token):
         bot_token=token,
         workdir=SESSION_DIR, 
         ipv6=False,
-        # Allow massive parallel streams
+        # RESTORED TO MAX SPEED
         max_concurrent_transmissions=256, 
         workers=32
     )
@@ -178,9 +180,6 @@ async def swarm_warmup(chat_id, target_channel):
     success_count = sum(results)
     
     msg_text = f"🛡 **Swarm Warmup:** {success_count}/{len(all_apps)} bots ready."
-    if success_count < len(all_apps):
-        msg_text += "\n⚠️ Some bots can't see the channel. Ensure they are members."
-    
     await status_msg.edit_text(msg_text)
     await asyncio.sleep(2)
     await status_msg.delete()
@@ -215,27 +214,17 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
     await queue.put(None)
 
 def calculate_cost(msg):
-    """
-    Cost System:
-    < 50 MB  = 1  (Massive parallel)
-    < 500 MB = 10 
-    > 500 MB = 50 (Heavy)
-    """
-    size = 0
-    if msg.document: size = msg.document.file_size
-    elif msg.video: size = msg.video.file_size
-    elif msg.audio: size = msg.audio.file_size
-    elif msg.photo: size = 1024 * 1024 # 1MB
-
-    if size < 50 * 1024 * 1024: return 1
-    if size < 500 * 1024 * 1024: return 10
-    return 50
+    return 1 # High Concurrency for small files
 
 async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost, unique_id):
-    """The actual IO task running in background."""
     try:
         active_downloads[chat_id][unique_id] = 0
         
+        # Ensure client is connected before downloading
+        if not client_inst.is_connected:
+             try: await client_inst.connect()
+             except: pass
+
         try:
             f_path = await client_inst.download_media(
                 msg,
@@ -244,7 +233,6 @@ async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost,
                 progress_args=(unique_id, chat_id)
             )
         except (FileReferenceExpired, PeerIdInvalid):
-            # Refetch
             fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
             f_path = await client_inst.download_media(
                 fresh_msg,
@@ -252,10 +240,21 @@ async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost,
                 progress=progress_callback,
                 progress_args=(unique_id, chat_id)
             )
+        except ConnectionError:
+             logger.warning(f"{client_inst.name} lost connection, retrying...")
+             await asyncio.sleep(1)
+             # Simple retry once
+             fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
+             f_path = await client_inst.download_media(
+                fresh_msg,
+                file_name=os.path.join(user_dir, ""),
+                progress=progress_callback,
+                progress_args=(unique_id, chat_id)
+            )
+
 
         if f_path:
             f_size = os.path.getsize(f_path)
-            # Safe Update of shared state (Dicts are thread-safe in GIL, but good to be careful)
             if chat_id in job_progress:
                 job_progress[chat_id]['finished_bytes'] += f_size
                 job_progress[chat_id]['current_chunk_size'] += f_size
@@ -266,20 +265,12 @@ async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost,
 
     except Exception as e:
         logger.error(f"{client_inst.name} DL Fail: {e}")
-    
     finally:
-        # Cleanup Stats
         if unique_id in active_downloads[chat_id]:
             del active_downloads[chat_id][unique_id]
-        # Release Budget
         await semaphore.release(cost)
 
 async def download_dispatcher(client_inst, queue, chat_id, user_dir, semaphore, stop_event):
-    """
-    DISPATCHER:
-    Does NOT wait for download.
-    Checks budget -> Spawns Task -> Repeats immediately.
-    """
     while not stop_event.is_set():
         try:
             msg = await asyncio.wait_for(queue.get(), timeout=1.0)
@@ -292,16 +283,10 @@ async def download_dispatcher(client_inst, queue, chat_id, user_dir, semaphore, 
 
         unique_id = f"{client_inst.name}_{msg.id}"
         cost = calculate_cost(msg)
-        
-        # Block until we have budget (Semaphore)
-        # If we have 200 budget and cost is 1, we pass immediately
         await semaphore.acquire(cost)
-        
-        # SPAWN BACKGROUND TASK
         asyncio.create_task(
             perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost, unique_id)
         )
-        
         queue.task_done()
 
 async def status_monitor(client, chat_id, stop_event):
@@ -321,26 +306,21 @@ async def status_monitor(client, chat_id, stop_event):
             
             now = time.time()
             time_diff = now - last_check_time
-            
             if time_diff >= 2.0:
                 bytes_diff = total_now - last_bytes_total
                 if bytes_diff < 0: bytes_diff = 0
-                
                 current_speed = (bytes_diff / time_diff) / (1024 * 1024)
                 avg_speed = (avg_speed * 0.7) + (current_speed * 0.3)
-                
                 last_bytes_total = total_now
                 last_check_time = now
 
-            active_workers = len(all_apps)
             active_dls_count = len(active_downloads.get(chat_id, {}))
-
             text = (
-                f"🤖 **Swarm Active: {active_workers} Bots**\n"
-                f"⚡ Speed: `{avg_speed:.2f} MB/s` ({(avg_speed * 8):.0f} Mbps)\n"
+                f"🤖 **Swarm Active: {len(all_apps)} Bots**\n"
+                f"⚡ Speed: `{avg_speed:.2f} MB/s`\n"
                 f"📥 Queue: `{data['queue_obj'].qsize()}`\n"
-                f"🔥 **Concurrent DLs:** `{active_dls_count}`\n"
-                f"💾 Chunk: `{(data['current_chunk_size'] + current_live)/1024/1024:.2f} MB`\n"
+                f"🔥 **Active DLs:** `{active_dls_count}`\n"
+                f"💾 Buffer: `{(data['current_chunk_size'])/1024/1024:.2f} MB`\n"
                 f"🔎 Scan: `{data['scanned']}` / `{data['total']}`\n"
                 f"📦 Part: `{data['part']}`\n"
                 f"🛑 /stop to cancel"
@@ -353,8 +333,56 @@ async def status_monitor(client, chat_id, stop_event):
             await asyncio.sleep(2)
         except Exception:
             pass
-            
     await msg.delete()
+
+# --- SMART SPLIT & UPLOAD LOGIC ---
+async def process_and_upload(chat_id, all_files, job, user_dir):
+    """Splits huge list of files into 1.9GB chunks."""
+    
+    chunk_files = []
+    chunk_size = 0
+    files_to_process = list(all_files)
+    
+    for file_path in files_to_process:
+        try:
+            f_size = os.path.getsize(file_path)
+        except: continue
+
+        # Split trigger
+        if chunk_size + f_size > TG_MAX_FILE_SIZE:
+            await zip_and_send(chat_id, chunk_files, job, user_dir)
+            chunk_files = []
+            chunk_size = 0
+        
+        chunk_files.append(file_path)
+        chunk_size += f_size
+    
+    if chunk_files:
+        await zip_and_send(chat_id, chunk_files, job, user_dir)
+
+async def zip_and_send(chat_id, files, job, user_dir):
+    if not files: return
+    
+    part_num = job_progress[chat_id]['part']
+    zip_name = job['naming'].format(part_num)
+    if not zip_name.endswith(".zip"): zip_name += ".zip"
+    zip_path = os.path.join(user_dir, zip_name)
+    
+    await main_app.send_message(chat_id, f"🤐 **Zipping {zip_name}...** ({len(files)} files)")
+    
+    try:
+        await asyncio.to_thread(zip_files, files, zip_path)
+        await main_app.send_document(chat_id, zip_path, caption=f"🗂 **{zip_name}**")
+        
+        job_progress[chat_id]['part'] += 1
+        await update_checkpoint(chat_id, job_progress[chat_id]['highest_id'], job_progress[chat_id]['part'])
+        
+    except Exception as e:
+        await main_app.send_message(chat_id, f"❌ Upload Failed: {e}")
+    
+    for f in files + [zip_path]:
+        try: os.remove(f)
+        except: pass
 
 async def manager_logic(chat_id):
     job = await get_job(chat_id)
@@ -383,9 +411,7 @@ async def manager_logic(chat_id):
         fetch_worker(main_app, job['target'], job['last_id'], job['end_id'], queue, stop_event, chat_id)
     )
 
-    # Use WEIGHTED Semaphores
     semaphores = [WeightedSemaphore(BOT_MAX_LOAD) for _ in all_apps]
-    
     for i, app_inst in enumerate(all_apps):
         asyncio.create_task(download_dispatcher(app_inst, queue, chat_id, user_dir, semaphores[i], stop_event))
 
@@ -398,41 +424,18 @@ async def manager_logic(chat_id):
         is_finished = fetch_task.done() and queue.empty() and not active_downloads.get(chat_id)
         
         if is_full or (is_finished and job_progress[chat_id]['files']):
-            files = list(job_progress[chat_id]['files'])
+            files_snapshot = list(job_progress[chat_id]['files'])
             job_progress[chat_id]['files'] = []
             job_progress[chat_id]['current_chunk_size'] = 0
             
-            zip_name = job['naming'].format(job_progress[chat_id]['part'])
-            if not zip_name.endswith(".zip"): zip_name += ".zip"
-            zip_path = os.path.join(user_dir, zip_name)
-            
-            await main_app.send_message(chat_id, f"🤐 **Zipping {zip_name}...**")
-            
-            await asyncio.to_thread(zip_files, files, zip_path)
-            
-            end_id = job_progress[chat_id]['highest_id']
-            try:
-                await main_app.send_document(
-                    chat_id, 
-                    zip_path, 
-                    caption=f"🗂 **{zip_name}**\nUP TO ID: {end_id}"
-                )
-                
-                job_progress[chat_id]['part'] += 1
-                await update_checkpoint(chat_id, end_id, job_progress[chat_id]['part'])
-            except Exception as e:
-                await main_app.send_message(chat_id, f"❌ Upload Failed: {e}")
-
-            for f in files + [zip_path]:
-                try: os.remove(f)
-                except: pass
+            await process_and_upload(chat_id, files_snapshot, job, user_dir)
 
         if is_finished: break
 
     if chat_id in stop_events: del stop_events[chat_id]
     await delete_job(chat_id)
     shutil.rmtree(user_dir, ignore_errors=True)
-    await main_app.send_message(chat_id, "✅ **Process Finished/Stopped.**")
+    await main_app.send_message(chat_id, "✅ **Process Finished.**")
 
 def zip_files(file_list, output_path):
     with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zipf:
@@ -440,14 +443,13 @@ def zip_files(file_list, output_path):
             if os.path.exists(f): zipf.write(f, os.path.basename(f))
 
 # --- HANDLERS ---
-
 @main_app.on_message(filters.command("stop"))
 async def stop_command(c, m):
     if m.chat.id in stop_events:
         stop_events[m.chat.id].set()
-        await m.reply_text("🛑 **Stopping Swarm...** (Takes a moment to clear tasks)")
+        await m.reply_text("🛑 **Stopping...**")
     else:
-        await m.reply_text("⚠️ No active process found.")
+        await m.reply_text("⚠️ No active process.")
 
 @main_app.on_message(filters.command("start"))
 async def start(c, m):
@@ -460,7 +462,6 @@ async def start(c, m):
 @main_app.on_message(filters.regex(r"(?:t\.me|telegram\.me|telegram\.dog)/") & filters.private)
 async def step1(c, m):
     if await get_job(m.chat.id): return await m.reply_text("⚠️ Busy.")
-    
     link = m.text.strip()
     target_id, end_id = None, None
     if "t.me/c/" in link:
@@ -473,7 +474,6 @@ async def step1(c, m):
     if not target_id: return await m.reply_text("❌ Bad Link.")
     try: await c.get_chat(target_id)
     except: return await m.reply_text("❌ **Main Bot** cannot access channel.")
-
     setup_state[m.chat.id] = {"step": "name", "target": target_id, "end_id": end_id}
     await m.reply_text("✅ **Link OK.**\nEnter Naming (e.g. `Pack-{}`) or `default`.")
 
@@ -481,7 +481,6 @@ async def step1(c, m):
 async def step2(c, m):
     state = setup_state.get(m.chat.id)
     if not state: return
-
     if state["step"] == "name":
         name = m.text.strip()
         if "default" in name.lower(): name = "Batch_{}"
@@ -490,7 +489,6 @@ async def step2(c, m):
         state["step"] = "size"
         setup_state[m.chat.id] = state
         await m.reply_text("📦 **Max Zip Size (MB)?**")
-
     elif state["step"] == "size":
         try: sz = int(m.text.strip()) * 1024 * 1024
         except: return await m.reply_text("❌ Number only.")
