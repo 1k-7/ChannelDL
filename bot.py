@@ -12,8 +12,7 @@ from pyrogram.errors import (
     PeerIdInvalid, 
     ChannelInvalid, 
     FileReferenceExpired, 
-    AuthKeyUnregistered,
-    ConnectionError
+    AuthKeyUnregistered
 )
 from dotenv import load_dotenv
 
