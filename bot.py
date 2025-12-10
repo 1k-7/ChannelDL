@@ -46,8 +46,7 @@ DB_NAME = "zipper_state.db"
 SESSION_DIR = "sessions"
 
 # --- TUNING ---
-# 100 = Concurrent downloads per bot
-BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 100))
+BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 300))
 QUEUE_MAX_SIZE = 10000 
 TG_MAX_FILE_SIZE = 1900 * 1024 * 1024 
 
@@ -58,6 +57,23 @@ logging.getLogger("pyrogram").setLevel(logging.ERROR)
 
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR)
+
+# --- LIGHTWEIGHT SEMAPHORE ---
+class WeightedSemaphore:
+    def __init__(self, value=1):
+        self._value = value
+        self._condition = asyncio.Condition()
+
+    async def acquire(self, weight=1):
+        async with self._condition:
+            while self._value < weight:
+                await self._condition.wait()
+            self._value -= weight
+
+    async def release(self, weight=1):
+        async with self._condition:
+            self._value += weight
+            self._condition.notify_all()
 
 # --- CLIENT FACTORY ---
 def create_client(name, token=None, session=None, is_manager=False):
@@ -289,6 +305,7 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
                     'size': f_size, 
                     'id': msg_id
                 })
+                # CHECKPOINT UPDATE LOGIC FIXED HERE
                 if msg_id > job_progress[chat_id]['highest_id']:
                     job_progress[chat_id]['highest_id'] = msg_id
 
@@ -373,6 +390,7 @@ async def zip_and_upload_logic(chat_id, user_dir):
     files_to_zip = []
     current_zip_size = 0
     
+    # Create COPY to iterate safely
     buffer_copy = list(buffer)
     for file_obj in buffer_copy:
         if current_zip_size + file_obj['size'] > TG_MAX_FILE_SIZE:
@@ -382,8 +400,10 @@ async def zip_and_upload_logic(chat_id, user_dir):
     
     if not files_to_zip: return 
 
+    # Remove from live buffer
     for f in files_to_zip:
-        if f in buffer: buffer.remove(f)
+        if f in buffer:
+            buffer.remove(f)
     
     removed_size = sum(f['size'] for f in files_to_zip)
     job_progress[chat_id]['current_buffer_size'] -= removed_size
@@ -464,6 +484,7 @@ async def manager_logic(chat_id):
         'current_buffer_size': 0, 'part': job['part'],
         'finished_bytes': 0, 
         'active_count': 0, 
+        'highest_id': start_point, # FIXED: Added Missing Key
         'file_buffer': [], 
         'queue_obj': queue,
         'pause_event': pause_event,
@@ -472,10 +493,10 @@ async def manager_logic(chat_id):
 
     # Pass Target ID to fetcher
     fetch_task = asyncio.create_task(
-        fetch_worker(main_app, target_chat_id, start_point, job['end_id'], queue, stop_event, chat_id)
+        fetch_worker(main_app, job['target'], start_point, job['end_id'], queue, stop_event, chat_id)
     )
 
-    semaphores = [asyncio.Semaphore(BOT_MAX_LOAD) for _ in worker_apps]
+    semaphores = [WeightedSemaphore(BOT_MAX_LOAD) for _ in worker_apps]
     for i, app_inst in enumerate(worker_apps):
         asyncio.create_task(download_dispatcher(app_inst, queue, chat_id, target_chat_id, user_dir, semaphores[i], stop_event, pause_event))
 
