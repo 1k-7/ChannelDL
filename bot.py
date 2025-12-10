@@ -7,13 +7,13 @@ import re
 import aiosqlite
 import time
 import traceback
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters, compose
 from pyrogram.errors import (
     FloodWait, 
     PeerIdInvalid, 
     ChannelInvalid, 
     FileReferenceExpired, 
-    AuthKeyUnregistered, 
+    AuthKeyUnregistered,
     UserNotParticipant
 )
 from dotenv import load_dotenv
@@ -140,7 +140,6 @@ async def get_job(chat_id):
                 }
             return None
 
-# NEW: Get ALL jobs for auto-resume
 async def get_all_jobs():
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT chat_id FROM jobs") as cursor:
@@ -199,22 +198,21 @@ def parse_link(link):
 
 async def swarm_warmup(chat_id, target_channel):
     logger.info("🔥 Warming up workers...")
-    try:
-        status_msg = await main_app.send_message(chat_id, "🛡 **Swarm Warmup...**")
-        
-        async def activate_bot(bot):
-            try:
-                await bot.get_chat(target_channel)
-                return True
-            except Exception: return False
+    status_msg = await main_app.send_message(chat_id, "🛡 **Swarm Warmup: checking access...**")
+    
+    async def activate_bot(bot):
+        try:
+            await bot.get_chat(target_channel)
+            return True
+        except Exception: return False
 
-        results = await asyncio.gather(*[activate_bot(bot) for bot in worker_apps])
-        await status_msg.edit_text(f"🛡 **Swarm Warmup:** {sum(results)}/{len(worker_apps)} workers ready.")
-        await asyncio.sleep(2)
-        await status_msg.delete()
-    except: pass # Ignore if user blocked bot/chat deleted
+    results = await asyncio.gather(*[activate_bot(bot) for bot in worker_apps])
+    success_count = sum(results)
+    await status_msg.edit_text(f"🛡 **Swarm Warmup:** {success_count}/{len(worker_apps)} workers ready.")
+    await asyncio.sleep(2)
+    await status_msg.delete()
 
-async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, chat_id):
+async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, progress_key):
     current = start_id
     batch_size = 500 
     print(f"🚀 Fetcher Started: {start_id} -> {end_id}")
@@ -224,8 +222,8 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
         ids = list(range(current, batch_end + 1))
         
         try:
-            if chat_id in job_progress:
-                job_progress[chat_id]['scanned'] = batch_end
+            if progress_key in job_progress:
+                job_progress[progress_key]['scanned'] = batch_end
 
             messages = await client.get_messages(target_chat, ids)
             
@@ -244,8 +242,8 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
             await asyncio.sleep(e.value)
         except Exception as e:
             print(f"⚠️ Fetcher Error on {current}-{batch_end}: {e}")
-            current = batch_end + 1
             await asyncio.sleep(1)
+            current = batch_end + 1
             
     await queue.put(None)
     print("✅ Fetching Complete.")
@@ -253,27 +251,20 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
 async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore):
     try:
         if chat_id in job_progress: job_progress[chat_id]['active_count'] += 1
+        
         if not client_inst.is_connected:
              try: await client_inst.connect()
              except: pass
 
         f_path = None
-        # Timeout Wrapper
-        async def _dl():
+        for attempt in range(3):
             try:
                 msg = await client_inst.get_messages(target_chat_id, msg_id)
-                if not msg or not msg.media: return None
-                return await client_inst.download_media(msg, file_name=os.path.join(user_dir, ""))
-            except (FileReferenceExpired, PeerIdInvalid):
-                try:
-                    fresh_msg = await client_inst.get_messages(target_chat_id, msg_id)
-                    return await client_inst.download_media(fresh_msg, file_name=os.path.join(user_dir, ""))
-                except: return None
-            except: return None
-
-        try:
-            f_path = await asyncio.wait_for(_dl(), timeout=600)
-        except: pass
+                if not msg or not msg.media: return
+                f_path = await client_inst.download_media(msg, file_name=os.path.join(user_dir, ""))
+                if f_path: break
+            except Exception:
+                await asyncio.sleep(1)
 
         if f_path:
             f_size = os.path.getsize(f_path)
@@ -324,7 +315,6 @@ async def upload_progress(current, total, message, zip_name):
 async def status_monitor(client, chat_id, stop_event):
     msg = await client.send_message(chat_id, "⏳ **Swarm Starting...**")
     last_text = ""
-    last_bytes = 0
     last_time = time.time()
 
     while not stop_event.is_set():
@@ -337,8 +327,8 @@ async def status_monitor(client, chat_id, stop_event):
             
             time_diff = now - last_time
             if time_diff >= 5.0:
-                speed = ((total_now - last_bytes) / time_diff) / (1024 * 1024)
-                last_bytes = total_now
+                speed = ((total_now - getattr(status_monitor, "last_bytes", 0)) / time_diff) / (1024 * 1024)
+                status_monitor.last_bytes = total_now
                 last_time = now
             else:
                 speed = getattr(status_monitor, "last_speed", 0.0)
@@ -368,24 +358,21 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     files_to_zip = []
     current_zip_size = 0
     
-    buffer_copy = list(buffer)
-    for file_obj in buffer_copy:
+    # Select files for this chunk
+    for file_obj in list(buffer):
         if current_zip_size + file_obj['size'] > max_zip_size:
             break
         files_to_zip.append(file_obj)
         current_zip_size += file_obj['size']
     
-    # If file is bigger than limit (rare), take it alone
+    # If a single file is bigger than chunk limit, we MUST process it
     if not files_to_zip and buffer:
         files_to_zip.append(buffer[0])
 
     if not files_to_zip: return 
 
-    for f in files_to_zip:
-        if f in buffer: buffer.remove(f)
-    
-    removed_size = sum(f['size'] for f in files_to_zip)
-    job_progress[chat_id]['current_buffer_size'] -= removed_size
+    # --- CRITICAL FIX: DO NOT REMOVE FROM BUFFER YET ---
+    # We keep them in memory. We only remove AFTER upload success.
 
     part_num = job_progress[chat_id]['part']
     zip_name = job_progress[chat_id]['naming'].format(part_num)
@@ -397,10 +384,13 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     file_paths = [f['path'] for f in files_to_zip]
     highest_id_in_zip = max((f['id'] for f in files_to_zip), default=0)
 
+    upload_success = False
+
     try:
         await asyncio.to_thread(zip_files, file_paths, zip_path)
         await status_msg.edit_text(f"⬆️ **Uploading {zip_name}...**")
         
+        # Upload Logic
         if premium_app and BOT_USERNAME and premium_app.is_connected:
             try:
                 async def upload_task():
@@ -413,6 +403,7 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
                     )
                 sent_msg = await asyncio.wait_for(upload_task(), timeout=7200)
                 await main_app.send_document(chat_id, sent_msg.document.file_id, caption=f"🗂 **{zip_name}**")
+                upload_success = True
             except asyncio.TimeoutError:
                 await main_app.send_message(chat_id, "⚠️ **Premium Timeout!** Retry via Main Bot...")
                 raise Exception("Timeout")
@@ -422,18 +413,35 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     except Exception:
         try:
             await main_app.send_document(chat_id, zip_path, caption=f"🗂 **{zip_name}**")
+            upload_success = True
         except Exception as e:
             await main_app.send_message(chat_id, f"❌ Upload Failed: {e}")
 
     await status_msg.delete()
     
-    job_progress[chat_id]['part'] += 1
-    if highest_id_in_zip > 0:
-        await update_checkpoint(chat_id, highest_id_in_zip, job_progress[chat_id]['part'])
-    
-    for f in file_paths + [zip_path]:
-        try: os.remove(f)
+    # --- CRITICAL FIX: ONLY REMOVE IF SUCCESSFUL ---
+    if upload_success:
+        for f in files_to_zip:
+            if f in buffer:
+                buffer.remove(f)
+        
+        removed_size = sum(f['size'] for f in files_to_zip)
+        job_progress[chat_id]['current_buffer_size'] -= removed_size
+        
+        job_progress[chat_id]['part'] += 1
+        if highest_id_in_zip > 0:
+            await update_checkpoint(chat_id, highest_id_in_zip, job_progress[chat_id]['part'])
+        
+        for f in file_paths + [zip_path]:
+            try: os.remove(f)
+            except: pass
+    else:
+        # If failed, we clean the zip but KEEP the source files in buffer
+        # This allows the loop to pick them up again and retry
+        try: os.remove(zip_path)
         except: pass
+        # Sleep to prevent tight failure loop
+        await asyncio.sleep(5)
 
 async def manager_logic(chat_id):
     job = await get_job(chat_id)
@@ -537,7 +545,6 @@ async def step1(c, m):
     try: await c.get_chat(target_id)
     except: return await m.reply_text("❌ **Main Bot** cannot access channel.")
     setup_state[m.chat.id] = {"step": "name", "target": target_id, "last_id": start_id, "end_id": end_id}
-    # ESCAPED BRACES FIXED
     await m.reply_text(f"✅ **Link OK.**\nRange: `{start_id}` -> `{end_id}`\nEnter Naming (e.g. `Pack-{{}}`) or `default`.")
 
 @main_app.on_message(filters.text & filters.private & ~filters.regex(r"^/") & ~filters.regex(r"t\.me"))
@@ -559,7 +566,6 @@ async def step2(c, m):
         del setup_state[m.chat.id]
         asyncio.create_task(manager_logic(m.chat.id))
 
-# --- AUTO-RESUME ENTRY POINT ---
 if __name__ == "__main__":
     if not os.path.exists(WORK_DIR): os.makedirs(WORK_DIR)
     loop = asyncio.get_event_loop()
@@ -567,15 +573,11 @@ if __name__ == "__main__":
     async def runner():
         await init_db()
         print("🔥 Starting Swarm...")
-        
-        # Start all bots
         await main_app.start()
         if premium_app: await premium_app.start()
         for w in worker_apps: await w.start()
-        
         print(f"✅ Bots Online. Checking pending jobs...")
         
-        # Check DB for active jobs
         active_jobs = await get_all_jobs()
         if active_jobs:
             print(f"🔄 Resuming {len(active_jobs)} jobs.")
@@ -585,7 +587,6 @@ if __name__ == "__main__":
                 asyncio.create_task(manager_logic(chat_id))
         
         await idle()
-        
         await main_app.stop()
         if premium_app: await premium_app.stop()
         for w in worker_apps: await w.stop()
