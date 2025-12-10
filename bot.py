@@ -46,7 +46,8 @@ DB_NAME = "zipper_state.db"
 SESSION_DIR = "sessions"
 
 # --- TUNING ---
-BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 300))
+# 100 = Concurrent downloads per bot
+BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 100))
 QUEUE_MAX_SIZE = 10000 
 TG_MAX_FILE_SIZE = 1900 * 1024 * 1024 
 
@@ -58,25 +59,9 @@ logging.getLogger("pyrogram").setLevel(logging.ERROR)
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR)
 
-# --- LIGHTWEIGHT SEMAPHORE ---
-class WeightedSemaphore:
-    def __init__(self, value=1):
-        self._value = value
-        self._condition = asyncio.Condition()
-
-    async def acquire(self, weight=1):
-        async with self._condition:
-            while self._value < weight:
-                await self._condition.wait()
-            self._value -= weight
-
-    async def release(self, weight=1):
-        async with self._condition:
-            self._value += weight
-            self._condition.notify_all()
-
 # --- CLIENT FACTORY ---
-def create_client(name, token=None, session=None):
+def create_client(name, token=None, session=None, is_manager=False):
+    concurrent = 64 if is_manager else 256
     return Client(
         name,
         api_id=API_ID,
@@ -85,17 +70,17 @@ def create_client(name, token=None, session=None):
         session_string=session,
         workdir=SESSION_DIR, 
         ipv6=False,
-        max_concurrent_transmissions=256, 
+        max_concurrent_transmissions=concurrent, 
         workers=32
     )
 
 print("🔥 Initializing Swarm...")
-main_app = create_client("main_bot", token=MAIN_BOT_TOKEN)
+main_app = create_client("main_bot", token=MAIN_BOT_TOKEN, is_manager=True)
 
 premium_app = None
 if SESSION_STRING:
     try:
-        premium_app = create_client("premium_uploader", session=SESSION_STRING)
+        premium_app = create_client("premium_uploader", session=SESSION_STRING, is_manager=True)
         print("💎 Premium Account Loaded!")
     except Exception as e:
         print(f"⚠️ Premium Error: {e}")
@@ -207,7 +192,11 @@ async def swarm_warmup(chat_id, target_channel):
     await status_msg.delete()
 
 async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, progress_key):
-    """PRODUCER: Runs on Main Bot."""
+    """
+    PRODUCER:
+    Fetches message IDs. Checks if they have media.
+    Puts ONLY THE ID (int) into the queue.
+    """
     current = start_id
     batch_size = 200 
     
@@ -221,63 +210,75 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
             if progress_key in job_progress:
                 job_progress[progress_key]['scanned'] = batch_end
 
-            # Using get_messages for explicit ID fetching
+            # Main Bot checks "Does this message exist and have a file?"
+            # It uses its own session to verify.
             messages = await client.get_messages(target_chat, ids)
             
             found = 0
             for msg in messages:
                 if not msg or msg.empty: continue
-                # GREEDY FILTER
-                if msg.media or msg.document or msg.video or msg.photo or msg.audio:
-                    await queue.put(msg)
+                # GREEDY FILTER: Any file
+                if msg.media:
+                    # Put ID ONLY. Workers must fetch the object themselves.
+                    await queue.put(msg.id)
                     found += 1
             
-            # Diagnostic: Only print if we found something OR if it's the first batch
-            if found > 0 or current == start_id:
-                print(f"🔎 Scanned {current}-{batch_end} | Found: {found}")
-            
+            print(f"🔎 Scanned {current}-{batch_end} | Found: {found}")
             current = batch_end + 1
             
         except FloodWait as e:
             print(f"⏳ Fetcher FloodWait: {e.value}s")
             await asyncio.sleep(e.value)
         except Exception as e:
-            print(f"⚠️ Fetcher Error on {current}-{batch_end}: {e}")
+            print(f"⚠️ Fetcher Error on {current}: {e}")
             current = batch_end + 1
             await asyncio.sleep(1)
             
     await queue.put(None)
     print("✅ Fetching Complete.")
 
-def calculate_cost(msg):
-    return 1
-
-async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost):
+async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore):
+    """
+    WORKER LOGIC:
+    1. Receive msg_id (int)
+    2. Fetch Message Object (using OWN session)
+    3. Download
+    """
     try:
         if chat_id in job_progress: job_progress[chat_id]['active_count'] += 1
         
-        # Ensure connected
+        # Ensure connection
         if not client_inst.is_connected:
              try: await client_inst.connect()
              except: pass
 
         f_path = None
-        
-        # 3 Retries
-        for attempt in range(3):
-            try:
-                f_path = await client_inst.download_media(msg, file_name=os.path.join(user_dir, ""))
-                if f_path: break
-            except (FileReferenceExpired, PeerIdInvalid):
-                # Refetch message
-                try:
-                    fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
-                    f_path = await client_inst.download_media(fresh_msg, file_name=os.path.join(user_dir, ""))
-                    if f_path: break
-                except: pass
-            except Exception:
-                await asyncio.sleep(1)
+        msg = None
 
+        # Step 1: Fetch Message Object
+        try:
+            msg = await client_inst.get_messages(target_chat_id, msg_id)
+        except Exception as e:
+            print(f"❌ {client_inst.name} failed to fetch ID {msg_id}: {e}")
+            return
+
+        if not msg or not msg.media:
+            return
+
+        # Step 2: Download
+        try:
+            f_path = await client_inst.download_media(msg, file_name=os.path.join(user_dir, ""))
+        except (FileReferenceExpired, PeerIdInvalid):
+            # Retry fetch once
+            try:
+                msg = await client_inst.get_messages(target_chat_id, msg_id)
+                f_path = await client_inst.download_media(msg, file_name=os.path.join(user_dir, ""))
+            except Exception as e:
+                print(f"❌ {client_inst.name} retry failed for {msg_id}: {e}")
+        except Exception as e:
+            print(f"❌ {client_inst.name} download failed for {msg_id}: {e}")
+
+        # Step 3: Success Tracking
         if f_path:
             f_size = os.path.getsize(f_path)
             if chat_id in job_progress:
@@ -286,31 +287,32 @@ async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost)
                 job_progress[chat_id]['file_buffer'].append({
                     'path': f_path, 
                     'size': f_size, 
-                    'id': msg.id
+                    'id': msg_id
                 })
+                if msg_id > job_progress[chat_id]['highest_id']:
+                    job_progress[chat_id]['highest_id'] = msg_id
 
-    except Exception: pass
+    except Exception as e:
+        print(f"⚠️ Worker Critical Error: {e}")
     finally:
         if chat_id in job_progress: job_progress[chat_id]['active_count'] -= 1
-        await semaphore.release(cost)
+        semaphore.release()
 
-async def download_dispatcher(client_inst, queue, chat_id, user_dir, semaphore, stop_event, pause_event):
+async def download_dispatcher(client_inst, queue, chat_id, target_chat_id, user_dir, semaphore, stop_event, pause_event):
     while not stop_event.is_set():
         await pause_event.wait()
         
         try:
-            # 2s Timeout to allow checking stop/pause
-            msg = await asyncio.wait_for(queue.get(), timeout=2.0)
+            # Get ID (int)
+            msg_id = await asyncio.wait_for(queue.get(), timeout=1.0)
         except asyncio.TimeoutError: continue
         
-        if msg is None:
-            # Put back for other workers
+        if msg_id is None:
             await queue.put(None)
             break
 
-        cost = calculate_cost(msg)
-        await semaphore.acquire(cost)
-        asyncio.create_task(perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost))
+        await semaphore.acquire()
+        asyncio.create_task(perform_download(client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore))
         queue.task_done()
 
 last_upload_edit = 0
@@ -444,7 +446,8 @@ async def manager_logic(chat_id):
     pause_event = asyncio.Event()
     pause_event.set() 
 
-    await swarm_warmup(chat_id, job['target'])
+    target_chat_id = job['target'] # Needed for workers to fetch
+    await swarm_warmup(chat_id, target_channel=target_chat_id)
 
     user_dir = os.path.join(WORK_DIR, str(chat_id))
     if os.path.exists(user_dir): shutil.rmtree(user_dir)
@@ -467,15 +470,14 @@ async def manager_logic(chat_id):
         'naming': job['naming']
     }
 
-    # 1. Start Fetcher (Main Bot ONLY)
+    # Pass Target ID to fetcher
     fetch_task = asyncio.create_task(
-        fetch_worker(main_app, job['target'], start_point, job['end_id'], queue, stop_event, chat_id)
+        fetch_worker(main_app, target_chat_id, start_point, job['end_id'], queue, stop_event, chat_id)
     )
 
-    # 2. Start Downloaders (Worker Bots ONLY)
-    semaphores = [WeightedSemaphore(BOT_MAX_LOAD) for _ in worker_apps]
+    semaphores = [asyncio.Semaphore(BOT_MAX_LOAD) for _ in worker_apps]
     for i, app_inst in enumerate(worker_apps):
-        asyncio.create_task(download_dispatcher(app_inst, queue, chat_id, user_dir, semaphores[i], stop_event, pause_event))
+        asyncio.create_task(download_dispatcher(app_inst, queue, chat_id, target_chat_id, user_dir, semaphores[i], stop_event, pause_event))
 
     asyncio.create_task(status_monitor(main_app, chat_id, stop_event))
 
