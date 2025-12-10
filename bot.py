@@ -76,8 +76,7 @@ class WeightedSemaphore:
             self._condition.notify_all()
 
 # --- CLIENT FACTORY ---
-def create_client(name, token=None, session=None, is_manager=False):
-    concurrent = 64 if is_manager else 256
+def create_client(name, token=None, session=None):
     return Client(
         name,
         api_id=API_ID,
@@ -86,17 +85,17 @@ def create_client(name, token=None, session=None, is_manager=False):
         session_string=session,
         workdir=SESSION_DIR, 
         ipv6=False,
-        max_concurrent_transmissions=concurrent, 
+        max_concurrent_transmissions=256, 
         workers=32
     )
 
 print("🔥 Initializing Swarm...")
-main_app = create_client("main_bot", token=MAIN_BOT_TOKEN, is_manager=True)
+main_app = create_client("main_bot", token=MAIN_BOT_TOKEN)
 
 premium_app = None
 if SESSION_STRING:
     try:
-        premium_app = create_client("premium_uploader", session=SESSION_STRING, is_manager=True)
+        premium_app = create_client("premium_uploader", session=SESSION_STRING)
         print("💎 Premium Account Loaded!")
     except Exception as e:
         print(f"⚠️ Premium Error: {e}")
@@ -134,15 +133,9 @@ async def get_job(chat_id):
         async with db.execute("SELECT * FROM jobs WHERE chat_id = ?", (chat_id,)) as cursor:
             row = await cursor.fetchone()
             if row:
-                # FIXED KEYS MAPPING HERE
                 return {
-                    "chat_id": row[0], 
-                    "target": row[1], 
-                    "last_processed_id": row[2], # Was 'last_id' causing error
-                    "end_id": row[3], 
-                    "max_size": row[4], 
-                    "naming": row[5], 
-                    "part": row[6]
+                    "chat_id": row[0], "target": row[1], "last_processed_id": row[2],
+                    "end_id": row[3], "max_size": row[4], "naming": row[5], "part": row[6]
                 }
             return None
 
@@ -213,7 +206,8 @@ async def swarm_warmup(chat_id, target_channel):
     await asyncio.sleep(2)
     await status_msg.delete()
 
-async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, chat_id):
+async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, progress_key):
+    """PRODUCER: Runs on Main Bot."""
     current = start_id
     batch_size = 200 
     
@@ -224,20 +218,24 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
         ids = list(range(current, batch_end + 1))
         
         try:
-            if chat_id in job_progress:
-                job_progress[chat_id]['scanned'] = batch_end
+            if progress_key in job_progress:
+                job_progress[progress_key]['scanned'] = batch_end
 
+            # Using get_messages for explicit ID fetching
             messages = await client.get_messages(target_chat, ids)
             
             found = 0
             for msg in messages:
-                if msg.empty: continue
-                if msg.media:
-                    if msg.document or msg.video or msg.audio or msg.photo or msg.voice or msg.video_note or msg.animation:
-                        await queue.put(msg)
-                        found += 1
+                if not msg or msg.empty: continue
+                # GREEDY FILTER
+                if msg.media or msg.document or msg.video or msg.photo or msg.audio:
+                    await queue.put(msg)
+                    found += 1
             
-            print(f"🔎 Scanned {current}-{batch_end} | Found: {found}")
+            # Diagnostic: Only print if we found something OR if it's the first batch
+            if found > 0 or current == start_id:
+                print(f"🔎 Scanned {current}-{batch_end} | Found: {found}")
+            
             current = batch_end + 1
             
         except FloodWait as e:
@@ -245,9 +243,8 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
             await asyncio.sleep(e.value)
         except Exception as e:
             print(f"⚠️ Fetcher Error on {current}-{batch_end}: {e}")
-            await asyncio.sleep(1)
-            # Skip failed batch to prevent stuck loop
             current = batch_end + 1
+            await asyncio.sleep(1)
             
     await queue.put(None)
     print("✅ Fetching Complete.")
@@ -259,30 +256,27 @@ async def perform_download(client_inst, msg, chat_id, user_dir, semaphore, cost)
     try:
         if chat_id in job_progress: job_progress[chat_id]['active_count'] += 1
         
+        # Ensure connected
         if not client_inst.is_connected:
              try: await client_inst.connect()
              except: pass
 
         f_path = None
         
-        # --- DOWNLOAD WRAPPER WITH TIMEOUT ---
-        async def _download():
+        # 3 Retries
+        for attempt in range(3):
             try:
-                return await client_inst.download_media(msg, file_name=os.path.join(user_dir, ""))
+                f_path = await client_inst.download_media(msg, file_name=os.path.join(user_dir, ""))
+                if f_path: break
             except (FileReferenceExpired, PeerIdInvalid):
-                fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
-                return await client_inst.download_media(fresh_msg, file_name=os.path.join(user_dir, ""))
+                # Refetch message
+                try:
+                    fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
+                    f_path = await client_inst.download_media(fresh_msg, file_name=os.path.join(user_dir, ""))
+                    if f_path: break
+                except: pass
             except Exception:
                 await asyncio.sleep(1)
-                fresh_msg = await client_inst.get_messages(msg.chat.id, msg.id)
-                return await client_inst.download_media(fresh_msg, file_name=os.path.join(user_dir, ""))
-
-        try:
-            f_path = await asyncio.wait_for(_download(), timeout=600)
-        except asyncio.TimeoutError:
-            print(f"⚠️ Timeout downloading message {msg.id}")
-        except Exception:
-            pass
 
         if f_path:
             f_size = os.path.getsize(f_path)
@@ -305,10 +299,12 @@ async def download_dispatcher(client_inst, queue, chat_id, user_dir, semaphore, 
         await pause_event.wait()
         
         try:
-            msg = await asyncio.wait_for(queue.get(), timeout=1.0)
+            # 2s Timeout to allow checking stop/pause
+            msg = await asyncio.wait_for(queue.get(), timeout=2.0)
         except asyncio.TimeoutError: continue
         
         if msg is None:
+            # Put back for other workers
             await queue.put(None)
             break
 
@@ -351,7 +347,7 @@ async def status_monitor(client, chat_id, stop_event):
                 speed = getattr(status_monitor, "last_speed", 0.0)
             status_monitor.last_speed = speed
 
-            status_text = "🟢 **DOWNLOADING**" if data['pause_event'].is_set() else "🟠 **UPLOADING (Downloads Paused)**"
+            status_text = "🟢 **DOWNLOADING**" if data['pause_event'].is_set() else "🟠 **UPLOADING**"
 
             text = (
                 f"🤖 **Swarm Status:** {status_text}\n"
@@ -375,10 +371,9 @@ async def zip_and_upload_logic(chat_id, user_dir):
     files_to_zip = []
     current_zip_size = 0
     
-    # Safely iterate copy
     buffer_copy = list(buffer)
     for file_obj in buffer_copy:
-        if current_zip_size + file_obj['size'] > TARGET_ZIP_SIZE:
+        if current_zip_size + file_obj['size'] > TG_MAX_FILE_SIZE:
             break
         files_to_zip.append(file_obj)
         current_zip_size += file_obj['size']
@@ -386,7 +381,7 @@ async def zip_and_upload_logic(chat_id, user_dir):
     if not files_to_zip: return 
 
     for f in files_to_zip:
-        buffer.remove(f)
+        if f in buffer: buffer.remove(f)
     
     removed_size = sum(f['size'] for f in files_to_zip)
     job_progress[chat_id]['current_buffer_size'] -= removed_size
@@ -457,13 +452,9 @@ async def manager_logic(chat_id):
     
     queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
     
-    # CORRECT RESUME LOGIC
-    # If part_count > 1, we resume from last_processed_id + 1
-    # If part_count == 1, we start from last_processed_id (which is initial start_id)
-    if job['part'] > 1:
+    start_point = max(job['last_processed_id'] or 1, 1)
+    if job['last_processed_id'] and job['last_processed_id'] > 0:
         start_point = job['last_processed_id'] + 1
-    else:
-        start_point = job['last_processed_id']
 
     job_progress[chat_id] = {
         'scanned': start_point, 'total': job['end_id'], 
@@ -476,10 +467,12 @@ async def manager_logic(chat_id):
         'naming': job['naming']
     }
 
+    # 1. Start Fetcher (Main Bot ONLY)
     fetch_task = asyncio.create_task(
         fetch_worker(main_app, job['target'], start_point, job['end_id'], queue, stop_event, chat_id)
     )
 
+    # 2. Start Downloaders (Worker Bots ONLY)
     semaphores = [WeightedSemaphore(BOT_MAX_LOAD) for _ in worker_apps]
     for i, app_inst in enumerate(worker_apps):
         asyncio.create_task(download_dispatcher(app_inst, queue, chat_id, user_dir, semaphores[i], stop_event, pause_event))
@@ -538,7 +531,6 @@ async def step1(c, m):
     if not target_id: return await m.reply_text("❌ Bad Link.")
     try: await c.get_chat(target_id)
     except: return await m.reply_text("❌ **Main Bot** cannot access channel.")
-    
     setup_state[m.chat.id] = {"step": "name", "target": target_id, "last_id": start_id, "end_id": end_id}
     await m.reply_text(f"✅ **Link OK.**\nRange: `{start_id}` -> `{end_id}`\nEnter Naming (e.g. `Pack-{{}}`) or `default`.")
 
