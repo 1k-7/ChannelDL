@@ -199,24 +199,16 @@ async def swarm_warmup(chat_id, target_channel):
     status_msg = await main_app.send_message(chat_id, "🛡 **Swarm Warmup (Fast)...**")
     
     async def check_worker(bot):
-        # 5 second timeout per bot. If it hangs, we kill it and move on.
         try:
-            return await asyncio.wait_for(
-                _safe_resolve(bot, target_channel), 
-                timeout=5
-            )
-        except: 
-            return False
+            return await asyncio.wait_for(_safe_resolve(bot, target_channel), timeout=5)
+        except: return False
 
     async def _safe_resolve(bot, target):
         try:
-            # We just want to check if the bot is alive and authenticated
-            # Resolving the peer is a good check
             await bot.resolve_peer(target)
             return True
         except: return False
 
-    # Launch all checks in parallel
     results = await asyncio.gather(*[check_worker(bot) for bot in worker_apps])
     success_count = sum(results)
     
@@ -225,11 +217,6 @@ async def swarm_warmup(chat_id, target_channel):
     await status_msg.delete()
 
 async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, chat_id):
-    """
-    PRODUCER:
-    Fetches IDs in batches of 50.
-    Retries batch indefinitely on error.
-    """
     current = start_id
     batch_size = 50 
     
@@ -243,7 +230,6 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
             if chat_id in job_progress:
                 job_progress[chat_id]['scanned'] = batch_end
 
-            # 10s Timeout for fetcher
             messages = await asyncio.wait_for(client.get_messages(target_chat, ids), timeout=10)
             
             found = 0
@@ -262,30 +248,32 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
         except FloodWait as e:
             print(f"⏳ Fetcher FloodWait: {e.value}s")
             await asyncio.sleep(e.value)
-        except Exception as e:
-            print(f"⚠️ Fetcher Error on {current}-{batch_end}: {e}")
+        except asyncio.TimeoutError:
+            print(f"⚠️ Fetcher Timeout on {current}. Retrying...")
             await asyncio.sleep(2)
-            # Retry same batch
+        except Exception as e:
+            print(f"⚠️ Fetcher Error on {current}: {e}")
+            await asyncio.sleep(2)
             
     await queue.put(None)
     print("✅ Fetching Complete.")
 
-async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore):
+async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore, queue):
     try:
         if chat_id in job_progress: job_progress[chat_id]['active_count'] += 1
         
-        # Deduplication
-        # (Fetch small metadata first to check name)
-        # Note: We can't easily check name without fetching message object
-        
+        # 1. Fetch Object
         msg = None
         try:
             msg = await client_inst.get_messages(target_chat_id, msg_id)
-        except Exception: return
+        except Exception: 
+            # NETWORK ERROR -> RE-QUEUE
+            await queue.put(msg_id)
+            return
 
         if not msg or not msg.media: return
 
-        # Dedupe check
+        # 2. Deduplication (Optional)
         file_name = None
         if msg.document: file_name = msg.document.file_name
         elif msg.video: file_name = msg.video.file_name
@@ -294,6 +282,7 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
         if chat_id in dedup_store and file_name and file_name in dedup_store[chat_id]:
             return 
 
+        # 3. Download
         f_path = None
         for attempt in range(3):
             try:
@@ -303,6 +292,7 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
                 await asyncio.sleep(1)
 
         if f_path:
+            # SUCCESS
             f_size = os.path.getsize(f_path)
             if chat_id in job_progress:
                 job_progress[chat_id]['finished_bytes'] += f_size
@@ -314,8 +304,14 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
                 })
                 if msg_id > job_progress[chat_id]['highest_id']:
                     job_progress[chat_id]['highest_id'] = msg_id
+        else:
+            # FAILURE -> RE-QUEUE (The Fix)
+            # print(f"⚠️ Failed to DL {msg_id}, Re-queueing...")
+            await queue.put(msg_id)
 
-    except Exception: pass
+    except Exception:
+        # CRITICAL FAILURE -> RE-QUEUE
+        await queue.put(msg_id)
     finally:
         if chat_id in job_progress: job_progress[chat_id]['active_count'] -= 1
         await semaphore.release()
@@ -333,7 +329,7 @@ async def download_dispatcher(client_inst, queue, chat_id, target_chat_id, user_
 
         await semaphore.acquire()
         asyncio.create_task(perform_download(
-            client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore
+            client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore, queue
         ))
         queue.task_done()
 
@@ -420,14 +416,14 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     zip_path = os.path.join(user_dir, zip_name)
     
     try:
-        first_id = files_to_zip[0]['id']
-        last_id = files_to_zip[-1]['id']
+        first_id = min(f['id'] for f in files_to_zip)
+        last_id = max(f['id'] for f in files_to_zip)
     except: first_id = last_id = 0
     
     status_msg = await main_app.send_message(chat_id, f"🤐 **Zipping {zip_name}...** ({len(files_to_zip)} files)")
     
     file_paths = [f['path'] for f in files_to_zip]
-    highest_id_in_zip = max((f['id'] for f in files_to_zip), default=0)
+    highest_id_in_zip = last_id # Use Max ID from ZIP content, not global tracker
 
     upload_success = False
     try:
