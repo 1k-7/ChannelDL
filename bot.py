@@ -46,7 +46,6 @@ SESSION_DIR = "sessions"
 # --- TUNING ---
 BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 300))
 QUEUE_MAX_SIZE = 15000 
-# UPDATED: 3.9 GB Limit (Safe for 4GB Premium)
 TG_MAX_FILE_SIZE = 3990 * 1024 * 1024 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -280,6 +279,7 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
         if chat_id in dedup_store and file_name and file_name in dedup_store[chat_id]:
             return 
 
+        # Download
         f_path = None
         for attempt in range(3):
             try:
@@ -288,7 +288,7 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
             except Exception:
                 await asyncio.sleep(1)
 
-        # INTEGRITY CHECK: Reject empty files
+        # CHECK DISK: Ensure file actually exists and > 0 bytes
         if f_path and os.path.exists(f_path) and os.path.getsize(f_path) > 0:
             f_size = os.path.getsize(f_path)
             if chat_id in job_progress:
@@ -302,7 +302,7 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
                 if msg_id > job_progress[chat_id]['highest_id']:
                     job_progress[chat_id]['highest_id'] = msg_id
         else:
-            # File missing or empty -> Retry
+            # Failed download or 0-byte file -> Retry
             await queue.put(msg_id)
 
     except Exception:
@@ -389,16 +389,20 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     
     buffer_copy = list(buffer)
     for file_obj in buffer_copy:
+        # Re-verify existence before zipping
+        if not os.path.exists(file_obj['path']):
+            # File lost? Remove from buffer so we don't try again here
+            buffer.remove(file_obj)
+            continue
+
         if current_zip_size + file_obj['size'] > max_zip_size:
             break
         files_to_zip.append(file_obj)
         current_zip_size += file_obj['size']
     
-    if not files_to_zip and buffer:
-        files_to_zip.append(buffer[0])
-
     if not files_to_zip: return 
 
+    # Remove from buffer logic
     for f in files_to_zip:
         if f in buffer: buffer.remove(f)
     
@@ -410,7 +414,6 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     if not zip_name.endswith(".zip"): zip_name += ".zip"
     zip_path = os.path.join(user_dir, zip_name)
     
-    # --- FIXED CAPTION SCOPE ---
     try:
         first_id = files_to_zip[0]['id']
         last_id = files_to_zip[-1]['id']
@@ -427,14 +430,18 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     sent_msg = None
 
     try:
+        # Create Zip
         await asyncio.to_thread(zip_files, file_paths, zip_path)
-        await status_msg.edit_text(f"⬆️ **Uploading {zip_name}...**")
         
-        file_size = os.path.getsize(zip_path)
+        # --- EMPTY ZIP CHECK ---
+        zip_size = os.path.getsize(zip_path)
+        if zip_size < 100: # Empty zip header is ~22 bytes
+            raise Exception("Generated Zip is Empty (Files missing on disk?)")
+
+        await status_msg.edit_text(f"⬆️ **Uploading {zip_name}...**")
         
         if premium_app and BOT_USERNAME and premium_app.is_connected:
             try:
-                # REMOVED TIMEOUT
                 sent_msg = await premium_app.send_document(
                     BOT_USERNAME, zip_path, caption=caption,
                     progress=upload_progress, progress_args=(status_msg, zip_name)
@@ -453,7 +460,7 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
                 except: pass
                 
                 if not upload_success:
-                    if file_size <= 2000 * 1024 * 1024:
+                    if zip_size <= 2000 * 1024 * 1024:
                         raise Exception("Fallback to Main Bot") 
                     else:
                         raise Exception(f"Upload Failed: {e}")
@@ -462,14 +469,13 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
 
     except Exception:
         try:
-            # Safe Fallback Check
             if os.path.exists(zip_path):
-                file_size = os.path.getsize(zip_path)
-                if file_size <= 2000 * 1024 * 1024:
+                zip_size = os.path.getsize(zip_path)
+                if zip_size <= 2000 * 1024 * 1024:
                     await main_app.send_document(chat_id, zip_path, caption=caption)
                     upload_success = True
                 else:
-                    await main_app.send_message(chat_id, f"❌ Upload Failed: File is {file_size/1024/1024:.2f}MB (Too big for Bot API)")
+                    await main_app.send_message(chat_id, f"❌ Upload Failed: File is {zip_size/1024/1024:.2f}MB (Too big for Bot API)")
         except Exception as e:
             await main_app.send_message(chat_id, f"❌ Critical Upload Failure: {e}")
 
@@ -488,9 +494,28 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
             try: os.remove(f)
             except: pass
     else:
+        # Failure: Delete zip, but DO NOT delete source files.
+        # Files are already removed from buffer above? NO.
+        # Wait... if failed, we removed them from buffer!
+        # FIX: We should only remove from buffer if success.
+        # BUT: I already removed them above. This is tricky.
+        # RE-ADD TO QUEUE LOGIC:
         try: os.remove(zip_path)
         except: pass
-        await asyncio.sleep(5)
+        
+        # If upload failed, the files are effectively lost from the current 'buffer' list
+        # but they still exist on disk.
+        # Since we removed them from 'buffer', the loop won't pick them up again.
+        # We must re-add them to the buffer or restart the job.
+        # For simplicity in this script: Restart Manager will pick them up if not checkpointed.
+        # But immediate recovery is better:
+        
+        # Re-add to buffer
+        for f in files_to_zip:
+            job_progress[chat_id]['file_buffer'].append(f)
+        job_progress[chat_id]['current_buffer_size'] += removed_size
+        
+        await asyncio.sleep(10) # Pause before retry
 
 async def manager_logic(chat_id, start_override=None):
     job = await get_job(chat_id)
@@ -564,7 +589,8 @@ async def manager_logic(chat_id, start_override=None):
 def zip_files(file_list, output_path):
     with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zipf:
         for f in file_list:
-            if os.path.exists(f): zipf.write(f, os.path.basename(f))
+            if os.path.exists(f) and os.path.getsize(f) > 0:
+                zipf.write(f, os.path.basename(f))
 
 # --- COMPARE HANDLERS ---
 @main_app.on_message(filters.command("compare"))
