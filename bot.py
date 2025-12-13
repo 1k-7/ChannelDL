@@ -262,18 +262,15 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
     try:
         if chat_id in job_progress: job_progress[chat_id]['active_count'] += 1
         
-        # 1. Fetch Object
         msg = None
         try:
             msg = await client_inst.get_messages(target_chat_id, msg_id)
         except Exception: 
-            # NETWORK ERROR -> RE-QUEUE
             await queue.put(msg_id)
             return
 
         if not msg or not msg.media: return
 
-        # 2. Deduplication (Optional)
         file_name = None
         if msg.document: file_name = msg.document.file_name
         elif msg.video: file_name = msg.video.file_name
@@ -282,7 +279,6 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
         if chat_id in dedup_store and file_name and file_name in dedup_store[chat_id]:
             return 
 
-        # 3. Download
         f_path = None
         for attempt in range(3):
             try:
@@ -292,7 +288,6 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
                 await asyncio.sleep(1)
 
         if f_path:
-            # SUCCESS
             f_size = os.path.getsize(f_path)
             if chat_id in job_progress:
                 job_progress[chat_id]['finished_bytes'] += f_size
@@ -305,12 +300,9 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
                 if msg_id > job_progress[chat_id]['highest_id']:
                     job_progress[chat_id]['highest_id'] = msg_id
         else:
-            # FAILURE -> RE-QUEUE (The Fix)
-            # print(f"⚠️ Failed to DL {msg_id}, Re-queueing...")
             await queue.put(msg_id)
 
     except Exception:
-        # CRITICAL FAILURE -> RE-QUEUE
         await queue.put(msg_id)
     finally:
         if chat_id in job_progress: job_progress[chat_id]['active_count'] -= 1
@@ -415,23 +407,25 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     if not zip_name.endswith(".zip"): zip_name += ".zip"
     zip_path = os.path.join(user_dir, zip_name)
     
+    # --- CAPTION SCOPE FIX ---
     try:
-        first_id = min(f['id'] for f in files_to_zip)
-        last_id = max(f['id'] for f in files_to_zip)
-    except: first_id = last_id = 0
-    
+        first_id = files_to_zip[0]['id']
+        last_id = files_to_zip[-1]['id']
+        caption = f"🗂 **{zip_name}**\n🆔 IDs: `{first_id}`-`{last_id}`"
+    except: 
+        caption = f"🗂 **{zip_name}**"
+    # -------------------------
+
     status_msg = await main_app.send_message(chat_id, f"🤐 **Zipping {zip_name}...** ({len(files_to_zip)} files)")
     
     file_paths = [f['path'] for f in files_to_zip]
-    highest_id_in_zip = last_id # Use Max ID from ZIP content, not global tracker
+    highest_id_in_zip = max((f['id'] for f in files_to_zip), default=0)
 
     upload_success = False
     try:
         await asyncio.to_thread(zip_files, file_paths, zip_path)
         await status_msg.edit_text(f"⬆️ **Uploading {zip_name}...**")
         
-        caption = f"🗂 **{zip_name}**\n🆔 IDs: `{first_id}`-`{last_id}`"
-
         if premium_app and BOT_USERNAME and premium_app.is_connected:
             try:
                 async def upload_task():
@@ -450,8 +444,9 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
 
     except Exception:
         try:
-            await main_app.send_document(chat_id, zip_path, caption=caption)
-            upload_success = True
+            if os.path.exists(zip_path):
+                await main_app.send_document(chat_id, zip_path, caption=caption)
+                upload_success = True
         except Exception as e:
             await main_app.send_message(chat_id, f"❌ Upload Failed: {e}")
 
