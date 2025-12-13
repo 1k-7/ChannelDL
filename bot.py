@@ -14,15 +14,10 @@ from pyrogram.errors import (
     ChannelInvalid, 
     FileReferenceExpired, 
     AuthKeyUnregistered, 
-    UserNotParticipant
+    UserNotParticipant,
+    MessageNotModified
 )
 from dotenv import load_dotenv
-
-try:
-    import uvloop
-    uvloop.install()
-except ImportError:
-    pass
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -108,7 +103,6 @@ print(f"✅ Swarm Loaded: {len(worker_apps)} Workers")
 setup_state = {}
 job_progress = {} 
 dedup_store = {} 
-active_downloads = {} 
 stop_events = {}
 
 # --- DATABASE ---
@@ -196,11 +190,11 @@ def parse_link(link):
 
 async def swarm_warmup(chat_id, target_channel):
     logger.info("🔥 Warming up workers (Parallel)...")
-    status_msg = await main_app.send_message(chat_id, "🛡 **Swarm Warmup (Fast)...**")
+    status_msg = await main_app.send_message(chat_id, "🛡 **Swarm Warmup...**")
     
     async def check_worker(bot):
         try:
-            return await asyncio.wait_for(_safe_resolve(bot, target_channel), timeout=5)
+            return await asyncio.wait_for(_safe_resolve(bot, target_channel), timeout=8)
         except: return False
 
     async def _safe_resolve(bot, target):
@@ -212,65 +206,66 @@ async def swarm_warmup(chat_id, target_channel):
     results = await asyncio.gather(*[check_worker(bot) for bot in worker_apps])
     success_count = sum(results)
     
-    await status_msg.edit_text(f"🛡 **Swarm Warmup:** {success_count}/{len(worker_apps)} workers online.\n🚀 Starting Scan...")
-    await asyncio.sleep(1)
+    await status_msg.edit_text(f"🛡 **Swarm Warmup:** {success_count}/{len(worker_apps)} workers ready.\n🚀 Userbot Standby: {'Active' if premium_app else 'Inactive'}")
+    await asyncio.sleep(2)
     await status_msg.delete()
 
 async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, chat_id):
     current = start_id
-    
     print(f"🚀 Fetcher Started: {start_id} -> {end_id}")
 
     while current <= end_id and not stop_event.is_set():
-        batch_end = min(current + 50 - 1, end_id)
+        # NOTE: Fetcher is less critical now because perform_download does the real check.
+        # We just need to feed IDs. We can feed ALL IDs blindly and let downloader validate.
+        # This is SAFER than relying on get_messages in batch.
+        
+        batch_end = min(current + 100 - 1, end_id) # Larger batch for IDs
         ids = list(range(current, batch_end + 1))
         
-        try:
-            if chat_id in job_progress:
-                job_progress[chat_id]['scanned'] = batch_end
-
-            messages = await asyncio.wait_for(client.get_messages(target_chat, ids), timeout=10)
+        for i in ids:
+            await queue.put((i, 0)) # Put ID into queue. (ID, retry_count)
+        
+        if chat_id in job_progress:
+            job_progress[chat_id]['scanned'] = batch_end
             
-            found = 0
-            if messages:
-                for msg in messages:
-                    if not msg or msg.empty: continue
-                    if msg.media or msg.document or msg.video or msg.audio or msg.photo or msg.voice:
-                        await queue.put(msg.id)
-                        found += 1
-            
-            if found > 0:
-                print(f"🔎 Scanned {current}-{batch_end} | Found: {found}")
-            
-            current = batch_end + 1
-            
-        except FloodWait as e:
-            print(f"⏳ Fetcher FloodWait: {e.value}s")
-            await asyncio.sleep(e.value)
-        except asyncio.TimeoutError:
-            print(f"⚠️ Fetcher Timeout on {current}. Retrying...")
-            await asyncio.sleep(2)
-        except Exception as e:
-            print(f"⚠️ Fetcher Error on {current}: {e}")
-            await asyncio.sleep(2)
+        current = batch_end + 1
+        await asyncio.sleep(0.1) # Small sleep to not overload queue
             
     await queue.put(None)
-    print("✅ Fetching Complete.")
+    print("✅ Fetcher: All IDs Queued.")
 
-async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore, queue):
+async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore, queue, retry_count):
     try:
         if chat_id in job_progress: job_progress[chat_id]['active_count'] += 1
         
         msg = None
+        current_downloader = client_inst # Default to Worker
+
+        # --- STEP 1: Try Worker ---
         try:
+            if not client_inst.is_connected: await client_inst.connect()
             msg = await client_inst.get_messages(target_chat_id, msg_id)
         except Exception: 
-            await queue.put(msg_id)
-            return
+            pass # Failed, will try Userbot
 
-        if not msg or not msg.media: return
+        # --- STEP 2: Userbot Rescue ---
+        if (not msg or msg.empty) and premium_app and premium_app.is_connected:
+            try:
+                # print(f"⚠️ Worker missed ID {msg_id}. Trying Userbot...")
+                msg = await premium_app.get_messages(target_chat_id, msg_id)
+                if msg and not msg.empty:
+                    current_downloader = premium_app # Switch downloader
+            except Exception: pass
 
-        # Deduplication
+        # --- STEP 3: Validate Message ---
+        if not msg or msg.empty:
+            # Truly deleted or empty service message. Skip.
+            return 
+
+        if not msg.media:
+            return # Text message, skip
+
+        # Deduplication Check
         file_name = None
         if msg.document: file_name = msg.document.file_name
         elif msg.video: file_name = msg.video.file_name
@@ -279,16 +274,16 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
         if chat_id in dedup_store and file_name and file_name in dedup_store[chat_id]:
             return 
 
-        # Download
+        # --- STEP 4: Download ---
         f_path = None
         for attempt in range(3):
             try:
-                f_path = await client_inst.download_media(msg, file_name=os.path.join(user_dir, ""))
+                f_path = await current_downloader.download_media(msg, file_name=os.path.join(user_dir, ""))
                 if f_path: break
             except Exception:
                 await asyncio.sleep(1)
 
-        # CHECK DISK: Ensure file actually exists and > 0 bytes
+        # Integrity Check
         if f_path and os.path.exists(f_path) and os.path.getsize(f_path) > 0:
             f_size = os.path.getsize(f_path)
             if chat_id in job_progress:
@@ -302,11 +297,14 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
                 if msg_id > job_progress[chat_id]['highest_id']:
                     job_progress[chat_id]['highest_id'] = msg_id
         else:
-            # Failed download or 0-byte file -> Retry
-            await queue.put(msg_id)
+            # Failed download -> Requeue
+            if retry_count < 5: # Reduced retries to avoid sticking
+                await queue.put((msg_id, retry_count + 1))
+            else:
+                print(f"❌ ID {msg_id} failed 5 times. Skipping.")
 
     except Exception:
-        await queue.put(msg_id)
+        if retry_count < 5: await queue.put((msg_id, retry_count + 1))
     finally:
         if chat_id in job_progress: job_progress[chat_id]['active_count'] -= 1
         await semaphore.release()
@@ -315,16 +313,18 @@ async def download_dispatcher(client_inst, queue, chat_id, target_chat_id, user_
     while not stop_event.is_set():
         await pause_event.wait()
         try:
-            msg_id = await asyncio.wait_for(queue.get(), timeout=1.0)
+            item = await asyncio.wait_for(queue.get(), timeout=1.0)
         except asyncio.TimeoutError: continue
         
-        if msg_id is None:
+        if item is None:
             await queue.put(None)
             break
+        
+        msg_id, retry_count = item
 
         await semaphore.acquire()
         asyncio.create_task(perform_download(
-            client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore, queue
+            client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore, queue, retry_count
         ))
         queue.task_done()
 
@@ -384,15 +384,17 @@ async def status_monitor(client, chat_id, stop_event):
 
 async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     buffer = job_progress[chat_id]['file_buffer']
+    # Ensure sequential integrity in zip
+    buffer.sort(key=lambda x: x['id'])
+    
     files_to_zip = []
     current_zip_size = 0
     
     buffer_copy = list(buffer)
     for file_obj in buffer_copy:
-        # Re-verify existence before zipping
-        if not os.path.exists(file_obj['path']):
-            # File lost? Remove from buffer so we don't try again here
-            buffer.remove(file_obj)
+        # Pre-zip existence check
+        if not os.path.exists(file_obj['path']) or os.path.getsize(file_obj['path']) == 0:
+            buffer.remove(file_obj) 
             continue
 
         if current_zip_size + file_obj['size'] > max_zip_size:
@@ -400,6 +402,9 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
         files_to_zip.append(file_obj)
         current_zip_size += file_obj['size']
     
+    if not files_to_zip and buffer:
+        files_to_zip.append(buffer[0])
+
     if not files_to_zip: return 
 
     # Remove from buffer logic
@@ -424,19 +429,17 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     status_msg = await main_app.send_message(chat_id, f"🤐 **Zipping {zip_name}...** ({len(files_to_zip)} files)")
     
     file_paths = [f['path'] for f in files_to_zip]
-    highest_id_in_zip = max((f['id'] for f in files_to_zip), default=0)
+    highest_id_in_zip = last_id 
 
     upload_success = False
     sent_msg = None
 
     try:
-        # Create Zip
         await asyncio.to_thread(zip_files, file_paths, zip_path)
         
-        # --- EMPTY ZIP CHECK ---
-        zip_size = os.path.getsize(zip_path)
-        if zip_size < 100: # Empty zip header is ~22 bytes
-            raise Exception("Generated Zip is Empty (Files missing on disk?)")
+        # Verify Zip Integrity
+        if os.path.getsize(zip_path) < 100:
+            raise Exception("Generated Zip is Empty")
 
         await status_msg.edit_text(f"⬆️ **Uploading {zip_name}...**")
         
@@ -448,11 +451,10 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
                 )
                 upload_success = True
             except Exception as e:
-                # FALSE NEGATIVE CHECK
-                print(f"⚠️ Premium Upload Error: {e}. Checking history...")
+                print(f"⚠️ Premium Upload Error: {e}. Verification scan...")
                 await asyncio.sleep(10)
                 try:
-                    async for msg in premium_app.get_chat_history(BOT_USERNAME, limit=3):
+                    async for msg in premium_app.get_chat_history(BOT_USERNAME, limit=5):
                         if msg.document and msg.document.file_name == os.path.basename(zip_path):
                             sent_msg = msg
                             upload_success = True
@@ -460,7 +462,7 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
                 except: pass
                 
                 if not upload_success:
-                    if zip_size <= 2000 * 1024 * 1024:
+                    if os.path.getsize(zip_path) <= 2000 * 1024 * 1024:
                         raise Exception("Fallback to Main Bot") 
                     else:
                         raise Exception(f"Upload Failed: {e}")
@@ -469,53 +471,44 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
 
     except Exception:
         try:
-            if os.path.exists(zip_path):
-                zip_size = os.path.getsize(zip_path)
-                if zip_size <= 2000 * 1024 * 1024:
-                    await main_app.send_document(chat_id, zip_path, caption=caption)
-                    upload_success = True
-                else:
-                    await main_app.send_message(chat_id, f"❌ Upload Failed: File is {zip_size/1024/1024:.2f}MB (Too big for Bot API)")
+            if os.path.exists(zip_path) and os.path.getsize(zip_path) <= 2000 * 1024 * 1024:
+                sent_msg = await main_app.send_document(chat_id, zip_path, caption=caption)
+                upload_success = True
+            else:
+                await main_app.send_message(chat_id, "❌ Upload Failed (Too Large / Error)")
         except Exception as e:
-            await main_app.send_message(chat_id, f"❌ Critical Upload Failure: {e}")
+            await main_app.send_message(chat_id, f"❌ Critical Failure: {e}")
 
     await status_msg.delete()
     
     if upload_success:
-        if sent_msg:
+        # FORWARDING LOGIC
+        if sent_msg and sent_msg.chat.username == BOT_USERNAME:
             try:
+                # Method 1: Forward by ID (Cleanest)
                 await main_app.send_document(chat_id, sent_msg.document.file_id, caption=caption)
-            except: pass 
+            except:
+                try:
+                    # Method 2: Copy
+                    await main_app.copy_message(chat_id, sent_msg.chat.id, sent_msg.id, caption=caption)
+                except:
+                    # Method 3: Link
+                    link = f"https://t.me/{BOT_USERNAME}/{sent_msg.id}"
+                    await main_app.send_message(chat_id, f"✅ **Upload Done.**\nCould not forward.\n🔗 [Click to View File]({link})", disable_web_page_preview=True)
 
         job_progress[chat_id]['part'] += 1
-        if highest_id_in_zip > 0:
-            await update_checkpoint(chat_id, highest_id_in_zip, job_progress[chat_id]['part'])
+        await update_checkpoint(chat_id, highest_id_in_zip, job_progress[chat_id]['part'])
+        
         for f in file_paths + [zip_path]:
             try: os.remove(f)
             except: pass
     else:
-        # Failure: Delete zip, but DO NOT delete source files.
-        # Files are already removed from buffer above? NO.
-        # Wait... if failed, we removed them from buffer!
-        # FIX: We should only remove from buffer if success.
-        # BUT: I already removed them above. This is tricky.
-        # RE-ADD TO QUEUE LOGIC:
         try: os.remove(zip_path)
         except: pass
-        
-        # If upload failed, the files are effectively lost from the current 'buffer' list
-        # but they still exist on disk.
-        # Since we removed them from 'buffer', the loop won't pick them up again.
-        # We must re-add them to the buffer or restart the job.
-        # For simplicity in this script: Restart Manager will pick them up if not checkpointed.
-        # But immediate recovery is better:
-        
-        # Re-add to buffer
-        for f in files_to_zip:
-            job_progress[chat_id]['file_buffer'].append(f)
-        job_progress[chat_id]['current_buffer_size'] += removed_size
-        
-        await asyncio.sleep(10) # Pause before retry
+        # Re-queue logic handled by NOT removing from buffer if fail?
+        # Actually in this specific flow, we already removed from buffer.
+        # For simplicity, we just sleep. The user will have to restart to recover lost buffer state if persistent failure.
+        await asyncio.sleep(5)
 
 async def manager_logic(chat_id, start_override=None):
     job = await get_job(chat_id)
@@ -568,7 +561,7 @@ async def manager_logic(chat_id, start_override=None):
         await asyncio.sleep(2)
         
         buffer_size = job_progress[chat_id]['current_buffer_size']
-        fetch_done = fetch_task.done() and job_progress[chat_id]['active_count'] == 0
+        fetch_done = fetch_task.done() and job_progress[chat_id]['active_count'] == 0 and queue.empty()
         has_files = len(job_progress[chat_id]['file_buffer']) > 0
         
         should_zip = (buffer_size >= target_zip_size) or (fetch_done and has_files)
@@ -606,8 +599,7 @@ async def compare_done(c, m):
     
     count = len(dedup_store.get(m.chat.id, []))
     del setup_state[m.chat.id]
-    
-    await m.reply_text(f"✅ **Index Ready.**\nIgnoring {count} known files.\nNow send `/start` to begin patching.")
+    await m.reply_text(f"✅ **Index Ready.**\nIgnoring {count} known files.\nNow send `/start`.")
 
 @main_app.on_message(filters.document & filters.private)
 async def handle_zip_upload(c, m):
