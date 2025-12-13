@@ -46,7 +46,8 @@ SESSION_DIR = "sessions"
 # --- TUNING ---
 BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 300))
 QUEUE_MAX_SIZE = 15000 
-TG_MAX_FILE_SIZE = 1900 * 1024 * 1024 
+# UPDATED: 3.85 GB Limit (Safe buffer for 4GB)
+TG_MAX_FILE_SIZE = 3950 * 1024 * 1024 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SwarmBot")
@@ -407,14 +408,12 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     if not zip_name.endswith(".zip"): zip_name += ".zip"
     zip_path = os.path.join(user_dir, zip_name)
     
-    # --- CAPTION SCOPE FIX ---
     try:
         first_id = files_to_zip[0]['id']
         last_id = files_to_zip[-1]['id']
         caption = f"🗂 **{zip_name}**\n🆔 IDs: `{first_id}`-`{last_id}`"
     except: 
         caption = f"🗂 **{zip_name}**"
-    # -------------------------
 
     status_msg = await main_app.send_message(chat_id, f"🤐 **Zipping {zip_name}...** ({len(files_to_zip)} files)")
     
@@ -426,6 +425,9 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
         await asyncio.to_thread(zip_files, file_paths, zip_path)
         await status_msg.edit_text(f"⬆️ **Uploading {zip_name}...**")
         
+        file_size = os.path.getsize(zip_path)
+        
+        # --- UPLOAD LOGIC ---
         if premium_app and BOT_USERNAME and premium_app.is_connected:
             try:
                 async def upload_task():
@@ -440,15 +442,23 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
                 await main_app.send_message(chat_id, "⚠️ **Premium Timeout!**")
                 raise Exception("Timeout")
         else:
-            raise Exception("No Premium")
+            # Main Bot Fallback check
+            if file_size > 2000 * 1024 * 1024:
+                raise Exception("File > 2GB. Cannot fallback to Main Bot.")
+            else:
+                raise Exception("No Premium")
 
     except Exception:
         try:
-            if os.path.exists(zip_path):
+            # Fallback ONLY if file is small enough
+            file_size = os.path.getsize(zip_path)
+            if file_size <= 2000 * 1024 * 1024:
                 await main_app.send_document(chat_id, zip_path, caption=caption)
                 upload_success = True
+            else:
+                await main_app.send_message(chat_id, f"❌ Upload Failed: File is {file_size/1024/1024:.2f}MB (Too big for Bot API)")
         except Exception as e:
-            await main_app.send_message(chat_id, f"❌ Upload Failed: {e}")
+            await main_app.send_message(chat_id, f"❌ Critical Upload Failure: {e}")
 
     await status_msg.delete()
     
