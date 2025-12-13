@@ -7,7 +7,6 @@ import re
 import aiosqlite
 import time
 import glob
-import random
 from pyrogram import Client, filters, compose, idle
 from pyrogram.errors import (
     FloodWait, 
@@ -196,37 +195,43 @@ def parse_link(link):
 # --- WORKER LOGIC ---
 
 async def swarm_warmup(chat_id, target_channel):
-    logger.info("🔥 Warming up workers...")
-    status_msg = await main_app.send_message(chat_id, "🛡 **Swarm Warmup (Staggered)...**")
+    logger.info("🔥 Warming up workers (Parallel)...")
+    status_msg = await main_app.send_message(chat_id, "🛡 **Swarm Warmup (Fast)...**")
     
-    success_count = 0
-    
-    # FIX: Staggered startup to avoid Rate Limits
-    for bot in worker_apps:
+    async def check_worker(bot):
+        # 5 second timeout per bot. If it hangs, we kill it and move on.
         try:
-            # Just checking connectivity first
-            if not bot.is_connected: await bot.connect()
-            
-            # Lightweight check
-            await bot.get_me() 
-            
-            # Explicitly resolve peer if possible, but don't crash
-            try: await bot.resolve_peer(target_channel)
-            except: pass
-            
-            success_count += 1
-            # Small random sleep to prevent flooding TG servers
-            await asyncio.sleep(0.5) 
-        except Exception as e:
-            print(f"⚠️ Worker {bot.name} failed warmup: {e}")
+            return await asyncio.wait_for(
+                _safe_resolve(bot, target_channel), 
+                timeout=5
+            )
+        except: 
+            return False
 
-    await status_msg.edit_text(f"🛡 **Swarm Warmup:** {success_count}/{len(worker_apps)} online.")
-    await asyncio.sleep(2)
+    async def _safe_resolve(bot, target):
+        try:
+            # We just want to check if the bot is alive and authenticated
+            # Resolving the peer is a good check
+            await bot.resolve_peer(target)
+            return True
+        except: return False
+
+    # Launch all checks in parallel
+    results = await asyncio.gather(*[check_worker(bot) for bot in worker_apps])
+    success_count = sum(results)
+    
+    await status_msg.edit_text(f"🛡 **Swarm Warmup:** {success_count}/{len(worker_apps)} workers online.\n🚀 Starting Scan...")
+    await asyncio.sleep(1)
     await status_msg.delete()
 
 async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, chat_id):
+    """
+    PRODUCER:
+    Fetches IDs in batches of 50.
+    Retries batch indefinitely on error.
+    """
     current = start_id
-    batch_size = 50 # SAFE SIZE
+    batch_size = 50 
     
     print(f"🚀 Fetcher Started: {start_id} -> {end_id}")
 
@@ -238,36 +243,29 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
             if chat_id in job_progress:
                 job_progress[chat_id]['scanned'] = batch_end
 
-            # FIX: Added Timeout to prevent hanging forever
-            messages = await asyncio.wait_for(client.get_messages(target_chat, ids), timeout=15)
+            # 10s Timeout for fetcher
+            messages = await asyncio.wait_for(client.get_messages(target_chat, ids), timeout=10)
             
             found = 0
             if messages:
                 for msg in messages:
                     if not msg or msg.empty: continue
-                    # SUPER GREEDY FILTER
                     if msg.media or msg.document or msg.video or msg.audio or msg.photo or msg.voice:
                         await queue.put(msg.id)
                         found += 1
             
             if found > 0:
                 print(f"🔎 Scanned {current}-{batch_end} | Found: {found}")
-            else:
-                # Diagnostic log for empty batches
-                pass
-                # print(f"⚠️ Batch {current}-{batch_end} returned no media.")
             
             current = batch_end + 1
             
         except FloodWait as e:
             print(f"⏳ Fetcher FloodWait: {e.value}s")
             await asyncio.sleep(e.value)
-        except asyncio.TimeoutError:
-            print(f"⚠️ Fetcher Timeout on {current}. Retrying...")
-            await asyncio.sleep(2)
         except Exception as e:
-            print(f"⚠️ Fetcher Error on {current}: {e}")
+            print(f"⚠️ Fetcher Error on {current}-{batch_end}: {e}")
             await asyncio.sleep(2)
+            # Retry same batch
             
     await queue.put(None)
     print("✅ Fetching Complete.")
@@ -276,10 +274,10 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
     try:
         if chat_id in job_progress: job_progress[chat_id]['active_count'] += 1
         
-        if not client_inst.is_connected:
-             try: await client_inst.connect()
-             except: pass
-
+        # Deduplication
+        # (Fetch small metadata first to check name)
+        # Note: We can't easily check name without fetching message object
+        
         msg = None
         try:
             msg = await client_inst.get_messages(target_chat_id, msg_id)
@@ -287,7 +285,7 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
 
         if not msg or not msg.media: return
 
-        # Deduplication
+        # Dedupe check
         file_name = None
         if msg.document: file_name = msg.document.file_name
         elif msg.video: file_name = msg.video.file_name
