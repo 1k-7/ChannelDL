@@ -43,11 +43,12 @@ SESSION_DIR = "sessions"
 try:
     soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
     print(f"🖥️ System File Limit: {soft_limit}")
+    # Reserve 200 handles for overhead, split rest among tasks
     SAFE_CONCURRENCY = max(10, soft_limit - 200)
 except:
-    SAFE_CONCURRENCY = 500 # Fallback
+    SAFE_CONCURRENCY = 500
 
-USER_SETTING = int(os.getenv("BOT_MAX_LOAD", 50)) 
+USER_SETTING = int(os.getenv("BOT_MAX_LOAD", 100)) 
 GLOBAL_MAX_CONCURRENT = min(USER_SETTING, SAFE_CONCURRENCY)
 
 print(f"🔒 Global Concurrency Cap: {GLOBAL_MAX_CONCURRENT} active downloads")
@@ -62,25 +63,9 @@ logging.getLogger("pyrogram").setLevel(logging.ERROR)
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR)
 
-# --- LIGHTWEIGHT SEMAPHORE ---
-class WeightedSemaphore:
-    def __init__(self, value=1):
-        self._value = value
-        self._condition = asyncio.Condition()
-
-    async def acquire(self, weight=1):
-        async with self._condition:
-            while self._value < weight:
-                await self._condition.wait()
-            self._value -= weight
-
-    async def release(self, weight=1):
-        async with self._condition:
-            self._value += weight
-            self._condition.notify_all()
-
 # --- CLIENT FACTORY ---
 def create_client(name, token=None, session=None, is_manager=False):
+    # Workers handle multiple concurrents now
     concurrent = 32
     return Client(
         name,
@@ -237,10 +222,21 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
             job_progress[chat_id]['scanned'] = batch_end
             
         current = batch_end + 1
-        await asyncio.sleep(0.1) 
+        # Throttle slightly to prevent queue explosion
+        if queue.qsize() > 5000:
+            await asyncio.sleep(1)
+        else:
+            await asyncio.sleep(0.05)
             
     await queue.put(None)
     print("✅ Fetcher: All IDs Queued.")
+
+async def protected_download_task(client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore, queue, retry_count):
+    # This wrapper ensures the semaphore is released no matter what
+    try:
+        await perform_download(client_inst, msg_id, chat_id, target_chat_id, user_dir, queue, retry_count)
+    finally:
+        semaphore.release()
 
 async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_dir, queue, retry_count):
     try:
@@ -277,14 +273,18 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
         if chat_id in dedup_store and file_name and file_name in dedup_store[chat_id]:
             return 
 
-        # 4. Download
+        # 4. Download (With Timeout)
         f_path = None
-        for attempt in range(3):
-            try:
+        try:
+            # 20 MINUTE TIMEOUT to prevent Ghost Connections hanging the swarm
+            async with asyncio.timeout(1200): 
                 f_path = await current_downloader.download_media(msg, file_name=os.path.join(user_dir, ""))
-                if f_path: break
-            except Exception:
-                await asyncio.sleep(1)
+        except asyncio.TimeoutError:
+            print(f"⚠️ ID {msg_id} Timed Out. Retrying...")
+            await queue.put((msg_id, retry_count + 1))
+            return
+        except Exception:
+            pass # Handle in outer block
 
         # Integrity Check
         if f_path and os.path.exists(f_path) and os.path.getsize(f_path) > 0:
@@ -323,14 +323,14 @@ async def download_dispatcher(client_inst, queue, chat_id, target_chat_id, user_
         
         msg_id, retry_count = item
 
+        # Acquire Global Semaphore
         await semaphore.acquire()
-        try:
-            await perform_download(
-                client_inst, msg_id, chat_id, target_chat_id, user_dir, queue, retry_count
-            )
-        finally:
-            semaphore.release()
-            
+        
+        # Fire and Forget (Concurrency restored!)
+        asyncio.create_task(protected_download_task(
+            client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore, queue, retry_count
+        ))
+        
         queue.task_done()
 
 last_upload_edit = 0
@@ -454,7 +454,7 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
             except Exception as e:
                 print(f"⚠️ Premium Upload Error: {e}")
                 await asyncio.sleep(5)
-                # Verification omitted to simplify flow and avoid stalls
+                # Verification omitted to simplify flow
                 if os.path.getsize(zip_path) <= 2000 * 1024 * 1024:
                      raise Exception("Fallback")
                 else:
@@ -667,12 +667,11 @@ if __name__ == "__main__":
         print("🔥 Starting Swarm...")
         await main_app.start()
         if premium_app: await premium_app.start()
-        for w in worker_apps:
+        for w in worker_apps: 
             if not w.is_connected:
                 await w.start()
         print(f"✅ Bots Online.")
         
-        # Resume pending jobs
         active_jobs = await get_all_jobs()
         if active_jobs:
             print(f"🔄 Resuming {len(active_jobs)} jobs.")
