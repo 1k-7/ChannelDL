@@ -50,7 +50,6 @@ BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 300))
 QUEUE_MAX_SIZE = 15000 
 TG_MAX_FILE_SIZE = 1900 * 1024 * 1024 
 
-# Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SwarmBot")
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
@@ -110,9 +109,9 @@ print(f"✅ Swarm Loaded: {len(worker_apps)} Workers")
 # Global State
 setup_state = {}
 job_progress = {} 
+dedup_store = {} # {chat_id: set(filenames)}
 active_downloads = {} 
 stop_events = {}
-dedup_lists = {} # Stores {chat_id: set(filenames)}
 
 # --- DATABASE ---
 async def init_db():
@@ -212,9 +211,14 @@ async def swarm_warmup(chat_id, target_channel):
     await asyncio.sleep(2)
     await status_msg.delete()
 
-async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, progress_key):
+async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, chat_id):
+    """
+    PRODUCER (HIGH RELIABILITY):
+    Fetches IDs in batches of 50 (Safe Zone).
+    Retries indefinitely on failure. NEVER skips a batch.
+    """
     current = start_id
-    batch_size = 500 
+    batch_size = 50 
     
     print(f"🚀 Fetcher Started: {start_id} -> {end_id}")
 
@@ -223,29 +227,35 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
         ids = list(range(current, batch_end + 1))
         
         try:
-            if progress_key in job_progress:
-                job_progress[progress_key]['scanned'] = batch_end
+            if chat_id in job_progress:
+                job_progress[chat_id]['scanned'] = batch_end
 
+            # Fetch Batch
             messages = await client.get_messages(target_chat, ids)
             
             found = 0
-            for msg in messages:
-                if not msg or msg.empty: continue
-                if msg.media:
-                    if msg.document or msg.video or msg.audio or msg.photo:
+            if messages:
+                for msg in messages:
+                    if not msg or msg.empty: continue
+                    # GREEDY FILTER
+                    if msg.media or msg.document or msg.video or msg.audio or msg.photo:
                         await queue.put(msg.id)
                         found += 1
             
-            print(f"🔎 Scanned {current}-{batch_end} | Found: {found}")
+            if found > 0:
+                print(f"🔎 Scanned {current}-{batch_end} | Found: {found}")
+            
+            # SUCCESS: Move forward
             current = batch_end + 1
             
         except FloodWait as e:
             print(f"⏳ Fetcher FloodWait: {e.value}s")
             await asyncio.sleep(e.value)
+            # DO NOT INCREMENT. RETRY.
         except Exception as e:
-            print(f"⚠️ Fetcher Error on {current}: {e}")
-            await asyncio.sleep(1)
-            current = batch_end + 1
+            print(f"⚠️ Fetcher Error on {current}-{batch_end}: {e}")
+            await asyncio.sleep(2)
+            # DO NOT INCREMENT. RETRY.
             
     await queue.put(None)
     print("✅ Fetching Complete.")
@@ -253,34 +263,29 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
 async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_dir, semaphore):
     try:
         if chat_id in job_progress: job_progress[chat_id]['active_count'] += 1
-        
         if not client_inst.is_connected:
              try: await client_inst.connect()
              except: pass
 
-        f_path = None
+        # 1. Fetch Object
         msg = None
-
-        # Fetch Message Object
         try:
             msg = await client_inst.get_messages(target_chat_id, msg_id)
         except Exception: return
 
         if not msg or not msg.media: return
 
-        # --- DEDUPLICATION CHECK ---
-        # If we are in "Compare Mode", check filename against blocklist
+        # 2. DEDUPLICATION CHECK (Repair Mode)
         file_name = None
         if msg.document: file_name = msg.document.file_name
         elif msg.video: file_name = msg.video.file_name
         elif msg.audio: file_name = msg.audio.file_name
         
-        # If filename exists in our dedupe list, SKIP DOWNLOAD
-        if chat_id in dedup_lists and file_name and file_name in dedup_lists[chat_id]:
-            # print(f"⏭️ Skipping duplicate: {file_name}")
-            return # Exit successfully without downloading
+        if chat_id in dedup_store and file_name and file_name in dedup_store[chat_id]:
+            return # Skip download (Already have it)
 
-        # Download
+        # 3. Download
+        f_path = None
         for attempt in range(3):
             try:
                 f_path = await client_inst.download_media(msg, file_name=os.path.join(user_dir, ""))
@@ -298,6 +303,7 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
                     'size': f_size, 
                     'id': msg_id
                 })
+                # Checkpoint highest ID
                 if msg_id > job_progress[chat_id]['highest_id']:
                     job_progress[chat_id]['highest_id'] = msg_id
 
@@ -337,7 +343,6 @@ async def upload_progress(current, total, message, zip_name):
 async def status_monitor(client, chat_id, stop_event):
     msg = await client.send_message(chat_id, "⏳ **Swarm Starting...**")
     last_text = ""
-    last_bytes = 0
     last_time = time.time()
 
     while not stop_event.is_set():
@@ -350,16 +355,15 @@ async def status_monitor(client, chat_id, stop_event):
             
             time_diff = now - last_time
             if time_diff >= 5.0:
-                speed = ((total_now - last_bytes) / time_diff) / (1024 * 1024)
-                last_bytes = total_now
+                speed = ((total_now - getattr(status_monitor, "last_bytes", 0)) / time_diff) / (1024 * 1024)
+                status_monitor.last_bytes = total_now
                 last_time = now
             else:
                 speed = getattr(status_monitor, "last_speed", 0.0)
             status_monitor.last_speed = speed
 
             status_text = "🟢 **DOWNLOADING**" if data['pause_event'].is_set() else "🟠 **UPLOADING**"
-            
-            dedup_status = f"🚫 Ignored: {len(dedup_lists[chat_id])} files" if chat_id in dedup_lists else ""
+            dedup_info = f"\n🚫 Index: `{len(dedup_store.get(chat_id, []))}` files" if chat_id in dedup_store else ""
 
             text = (
                 f"🤖 **Swarm Status:** {status_text}\n"
@@ -368,8 +372,8 @@ async def status_monitor(client, chat_id, stop_event):
                 f"📥 Queue: `{data['queue_obj'].qsize()}`\n"
                 f"💾 Buffer: `{(data['current_buffer_size'])/1024/1024:.2f} MB`\n"
                 f"🔎 Scanned: `{data['scanned']}`\n"
-                f"📦 Part: `{data['part']}`\n"
-                f"{dedup_status}"
+                f"📦 Part: `{data['part']}`"
+                f"{dedup_info}"
             )
 
             if text != last_text:
@@ -477,7 +481,6 @@ async def manager_logic(chat_id, start_override=None):
     
     queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
     
-    # DETERMINE START
     if start_override:
         start_point = start_override
     else:
@@ -538,73 +541,38 @@ def zip_files(file_list, output_path):
 # --- COMPARE HANDLERS ---
 @main_app.on_message(filters.command("compare"))
 async def compare_init(c, m):
-    # Step 1: Ask for Zip
     setup_state[m.chat.id] = {"step": "compare_zip"}
-    await m.reply_text("📂 **Send the Reference Zip (Part 8)**\nI will analyze it to skip duplicates.")
+    dedup_store[m.chat.id] = set()
+    await m.reply_text("📂 **Deduplication Mode**\nSend your existing ZIP files (one by one).\nWhen done, send `/done`.")
+
+@main_app.on_message(filters.command("done"))
+async def compare_done(c, m):
+    state = setup_state.get(m.chat.id)
+    if not state or state.get("step") != "compare_zip": return
+    
+    count = len(dedup_store.get(m.chat.id, []))
+    del setup_state[m.chat.id]
+    
+    await m.reply_text(f"✅ **Index Ready.**\nIgnoring {count} known files.\nNow send `/start` to begin patching.")
 
 @main_app.on_message(filters.document & filters.private)
 async def handle_zip_upload(c, m):
     state = setup_state.get(m.chat.id)
     if not state or state.get("step") != "compare_zip": return
 
-    status = await m.reply_text("⏳ **Analyzing Zip...**")
-    
-    # Download zip to temp
-    zip_path = await m.download()
-    
-    # Extract file list
-    filenames = set()
+    msg = await m.reply_text("⏳ Indexing...")
     try:
-        with zipfile.ZipFile(zip_path, 'r') as z:
-            filenames = set(z.namelist())
-    except:
-        await status.edit_text("❌ Invalid Zip.")
-        return
-    finally:
-        try: os.remove(zip_path)
-        except: pass
+        path = await m.download()
+        with zipfile.ZipFile(path, 'r') as z:
+            current_set = dedup_store.get(m.chat.id, set())
+            current_set.update(z.namelist())
+            dedup_store[m.chat.id] = current_set
+        os.remove(path)
+        await msg.edit_text(f"✅ Indexed `{m.document.file_name}`.\nTotal ignored: {len(dedup_store[m.chat.id])}")
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {e}")
 
-    # Store for session
-    dedup_lists[m.chat.id] = filenames
-    
-    # Move to next step
-    state["step"] = "compare_range"
-    setup_state[m.chat.id] = state
-    
-    await status.edit_text(
-        f"✅ **Indexed {len(filenames)} files.**\n"
-        f"Now send the Scan Range:\n`StartID-EndID`\n"
-        f"(e.g. `110000-126240`)"
-    )
-
-@main_app.on_message(filters.regex(r"^\d+-\d+$") & filters.private)
-async def handle_range(c, m):
-    state = setup_state.get(m.chat.id)
-    if not state or state.get("step") != "compare_range": return
-
-    try:
-        start_id, end_id = map(int, m.text.split("-"))
-    except: return
-
-    # Ensure job exists or create dummy? 
-    # User must have started a job before or we need to ask for link?
-    # Assuming job exists or we can just update the existing one.
-    job = await get_job(m.chat.id)
-    if not job:
-        await m.reply_text("❌ No active job configuration found. Send channel link first.")
-        return
-
-    # Update DB with new range
-    # Note: We don't change 'last_processed_id' in DB yet, 
-    # we just launch the manager with override.
-    
-    del setup_state[m.chat.id]
-    await m.reply_text(f"🚀 **Resuming Scan: {start_id} -> {end_id}**\nSkipping {len(dedup_lists[m.chat.id])} known files.")
-    
-    # Launch Manager with Start Override
-    asyncio.create_task(manager_logic(m.chat.id, start_override=start_id))
-
-# --- STANDARD HANDLERS ---
+# --- STANDARD COMMANDS ---
 @main_app.on_message(filters.command("stop"))
 async def stop_command(c, m):
     if m.chat.id in stop_events:
@@ -614,9 +582,17 @@ async def stop_command(c, m):
 
 @main_app.on_message(filters.command("start"))
 async def start(c, m):
-    if await get_job(m.chat.id):
-        await m.reply_text("🔄 **Resuming...**")
-        asyncio.create_task(manager_logic(m.chat.id))
+    job = await get_job(m.chat.id)
+    if job:
+        if m.chat.id in dedup_store:
+             # Scan entire channel from ID 1 to ensure full patch
+             await update_checkpoint(m.chat.id, 1, job['part'])
+             job['last_processed_id'] = 1
+             await m.reply_text("🔄 **Starting Repair Scan (ID 1 -> End)...**")
+             asyncio.create_task(manager_logic(m.chat.id, start_override=1))
+        else:
+             await m.reply_text("🔄 **Resuming...**")
+             asyncio.create_task(manager_logic(m.chat.id))
     else: await m.reply_text(f"🤖 **Swarm Ready.**\nWorkers: {len(worker_apps)}\nSend **Link** to start.")
 
 @main_app.on_message(filters.regex(r"(?:t\.me|telegram\.me|telegram\.dog)/") & filters.private)
