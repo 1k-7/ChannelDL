@@ -46,8 +46,8 @@ SESSION_DIR = "sessions"
 # --- TUNING ---
 BOT_MAX_LOAD = int(os.getenv("BOT_MAX_LOAD", 300))
 QUEUE_MAX_SIZE = 15000 
-# UPDATED: 3.85 GB Limit (Safe buffer for 4GB)
-TG_MAX_FILE_SIZE = 3950 * 1024 * 1024 
+# UPDATED: 3.9 GB Limit (Safe for 4GB Premium)
+TG_MAX_FILE_SIZE = 3990 * 1024 * 1024 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SwarmBot")
@@ -219,12 +219,11 @@ async def swarm_warmup(chat_id, target_channel):
 
 async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event, chat_id):
     current = start_id
-    batch_size = 50 
     
     print(f"🚀 Fetcher Started: {start_id} -> {end_id}")
 
     while current <= end_id and not stop_event.is_set():
-        batch_end = min(current + batch_size - 1, end_id)
+        batch_end = min(current + 50 - 1, end_id)
         ids = list(range(current, batch_end + 1))
         
         try:
@@ -272,6 +271,7 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
 
         if not msg or not msg.media: return
 
+        # Deduplication
         file_name = None
         if msg.document: file_name = msg.document.file_name
         elif msg.video: file_name = msg.video.file_name
@@ -288,7 +288,8 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
             except Exception:
                 await asyncio.sleep(1)
 
-        if f_path:
+        # INTEGRITY CHECK: Reject empty files
+        if f_path and os.path.exists(f_path) and os.path.getsize(f_path) > 0:
             f_size = os.path.getsize(f_path)
             if chat_id in job_progress:
                 job_progress[chat_id]['finished_bytes'] += f_size
@@ -301,6 +302,7 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
                 if msg_id > job_progress[chat_id]['highest_id']:
                     job_progress[chat_id]['highest_id'] = msg_id
         else:
+            # File missing or empty -> Retry
             await queue.put(msg_id)
 
     except Exception:
@@ -408,6 +410,7 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     if not zip_name.endswith(".zip"): zip_name += ".zip"
     zip_path = os.path.join(user_dir, zip_name)
     
+    # --- FIXED CAPTION SCOPE ---
     try:
         first_id = files_to_zip[0]['id']
         last_id = files_to_zip[-1]['id']
@@ -421,48 +424,63 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     highest_id_in_zip = max((f['id'] for f in files_to_zip), default=0)
 
     upload_success = False
+    sent_msg = None
+
     try:
         await asyncio.to_thread(zip_files, file_paths, zip_path)
         await status_msg.edit_text(f"⬆️ **Uploading {zip_name}...**")
         
         file_size = os.path.getsize(zip_path)
         
-        # --- UPLOAD LOGIC ---
         if premium_app and BOT_USERNAME and premium_app.is_connected:
             try:
-                async def upload_task():
-                    return await premium_app.send_document(
-                        BOT_USERNAME, zip_path, caption=caption,
-                        progress=upload_progress, progress_args=(status_msg, zip_name)
-                    )
-                sent_msg = await asyncio.wait_for(upload_task(), timeout=7200)
-                await main_app.send_document(chat_id, sent_msg.document.file_id, caption=caption)
+                # REMOVED TIMEOUT
+                sent_msg = await premium_app.send_document(
+                    BOT_USERNAME, zip_path, caption=caption,
+                    progress=upload_progress, progress_args=(status_msg, zip_name)
+                )
                 upload_success = True
-            except asyncio.TimeoutError:
-                await main_app.send_message(chat_id, "⚠️ **Premium Timeout!**")
-                raise Exception("Timeout")
+            except Exception as e:
+                # FALSE NEGATIVE CHECK
+                print(f"⚠️ Premium Upload Error: {e}. Checking history...")
+                await asyncio.sleep(10)
+                try:
+                    async for msg in premium_app.get_chat_history(BOT_USERNAME, limit=3):
+                        if msg.document and msg.document.file_name == os.path.basename(zip_path):
+                            sent_msg = msg
+                            upload_success = True
+                            break
+                except: pass
+                
+                if not upload_success:
+                    if file_size <= 2000 * 1024 * 1024:
+                        raise Exception("Fallback to Main Bot") 
+                    else:
+                        raise Exception(f"Upload Failed: {e}")
         else:
-            # Main Bot Fallback check
-            if file_size > 2000 * 1024 * 1024:
-                raise Exception("File > 2GB. Cannot fallback to Main Bot.")
-            else:
-                raise Exception("No Premium")
+            raise Exception("No Premium")
 
     except Exception:
         try:
-            # Fallback ONLY if file is small enough
-            file_size = os.path.getsize(zip_path)
-            if file_size <= 2000 * 1024 * 1024:
-                await main_app.send_document(chat_id, zip_path, caption=caption)
-                upload_success = True
-            else:
-                await main_app.send_message(chat_id, f"❌ Upload Failed: File is {file_size/1024/1024:.2f}MB (Too big for Bot API)")
+            # Safe Fallback Check
+            if os.path.exists(zip_path):
+                file_size = os.path.getsize(zip_path)
+                if file_size <= 2000 * 1024 * 1024:
+                    await main_app.send_document(chat_id, zip_path, caption=caption)
+                    upload_success = True
+                else:
+                    await main_app.send_message(chat_id, f"❌ Upload Failed: File is {file_size/1024/1024:.2f}MB (Too big for Bot API)")
         except Exception as e:
             await main_app.send_message(chat_id, f"❌ Critical Upload Failure: {e}")
 
     await status_msg.delete()
     
     if upload_success:
+        if sent_msg:
+            try:
+                await main_app.send_document(chat_id, sent_msg.document.file_id, caption=caption)
+            except: pass 
+
         job_progress[chat_id]['part'] += 1
         if highest_id_in_zip > 0:
             await update_checkpoint(chat_id, highest_id_in_zip, job_progress[chat_id]['part'])
