@@ -7,7 +7,7 @@ import re
 import aiosqlite
 import time
 import glob
-import resource # NEW: To check OS limits
+import resource
 from pyrogram import Client, filters, compose, idle
 from pyrogram.errors import (
     FloodWait, 
@@ -40,14 +40,13 @@ DB_NAME = "zipper_state.db"
 SESSION_DIR = "sessions"
 
 # --- SYSTEM RESOURCE LIMITS ---
-# Check what the OS allows
-soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
-print(f"🖥️ System File Limit: {soft_limit}")
+try:
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    print(f"🖥️ System File Limit: {soft_limit}")
+    SAFE_CONCURRENCY = max(10, soft_limit - 200)
+except:
+    SAFE_CONCURRENCY = 500 # Fallback
 
-# Calculate Safe Concurrency
-# Reserve 150 handles for System/DB/Logs/Zipping
-SAFE_CONCURRENCY = max(10, soft_limit - 200)
-# User setting vs System Limit (Take the lower one to be safe)
 USER_SETTING = int(os.getenv("BOT_MAX_LOAD", 50)) 
 GLOBAL_MAX_CONCURRENT = min(USER_SETTING, SAFE_CONCURRENCY)
 
@@ -63,9 +62,25 @@ logging.getLogger("pyrogram").setLevel(logging.ERROR)
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR)
 
+# --- LIGHTWEIGHT SEMAPHORE ---
+class WeightedSemaphore:
+    def __init__(self, value=1):
+        self._value = value
+        self._condition = asyncio.Condition()
+
+    async def acquire(self, weight=1):
+        async with self._condition:
+            while self._value < weight:
+                await self._condition.wait()
+            self._value -= weight
+
+    async def release(self, weight=1):
+        async with self._condition:
+            self._value += weight
+            self._condition.notify_all()
+
 # --- CLIENT FACTORY ---
 def create_client(name, token=None, session=None, is_manager=False):
-    # Workers don't need high concurrent transmissions per client if we limit globally
     concurrent = 32
     return Client(
         name,
@@ -228,7 +243,6 @@ async def fetch_worker(client, target_chat, start_id, end_id, queue, stop_event,
     print("✅ Fetcher: All IDs Queued.")
 
 async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_dir, queue, retry_count):
-    # This logic runs inside the semaphore, so we are safe on file handles now
     try:
         if chat_id in job_progress: job_progress[chat_id]['active_count'] += 1
         
@@ -239,7 +253,8 @@ async def perform_download(client_inst, msg_id, chat_id, target_chat_id, user_di
         try:
             if not client_inst.is_connected: await client_inst.connect()
             msg = await client_inst.get_messages(target_chat_id, msg_id)
-        except Exception: pass 
+        except Exception: 
+            pass 
 
         # 2. Rescue: Userbot
         if (not msg or msg.empty) and premium_app and premium_app.is_connected:
@@ -308,13 +323,8 @@ async def download_dispatcher(client_inst, queue, chat_id, target_chat_id, user_
         
         msg_id, retry_count = item
 
-        # GLOBAL SEMAPHORE ACQUIRE
         await semaphore.acquire()
         try:
-            # We await the task wrapper to ensure the semaphore is released correctly
-            # But we want concurrency, so we wrap it in a task but hold semaphore until task done?
-            # NO. WeightedSemaphore/Semaphore logic usually wraps the *start*.
-            # To limit open files, we must hold the semaphore *during* execution.
             await perform_download(
                 client_inst, msg_id, chat_id, target_chat_id, user_dir, queue, retry_count
             )
@@ -444,7 +454,7 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
             except Exception as e:
                 print(f"⚠️ Premium Upload Error: {e}")
                 await asyncio.sleep(5)
-                # Verify logic removed to keep it simple, rely on Python exception handling
+                # Verification omitted to simplify flow and avoid stalls
                 if os.path.getsize(zip_path) <= 2000 * 1024 * 1024:
                      raise Exception("Fallback")
                 else:
@@ -484,7 +494,6 @@ async def zip_and_upload_logic(chat_id, user_dir, max_zip_size):
     else:
         try: os.remove(zip_path)
         except: pass
-        # Return files to buffer so they aren't lost
         for f in files_to_zip:
             job_progress[chat_id]['file_buffer'].append(f)
         job_progress[chat_id]['current_buffer_size'] += removed_size
@@ -527,7 +536,6 @@ async def manager_logic(chat_id, start_override=None):
         fetch_worker(main_app, job['target'], start_point, job['end_id'], queue, stop_event, chat_id)
     )
 
-    # ONE GLOBAL SEMAPHORE
     global_semaphore = asyncio.Semaphore(GLOBAL_MAX_CONCURRENT)
 
     for i, app_inst in enumerate(worker_apps):
@@ -613,7 +621,6 @@ async def start(c, m):
     job = await get_job(m.chat.id)
     if job:
         if m.chat.id in dedup_store:
-             # Scan from ID 1 to verify everything against index
              await update_checkpoint(m.chat.id, 1, job['part'])
              job['last_processed_id'] = 1
              await m.reply_text("🔄 **Starting Repair Scan (ID 1 -> End)...**")
@@ -660,8 +667,18 @@ if __name__ == "__main__":
         print("🔥 Starting Swarm...")
         await main_app.start()
         if premium_app: await premium_app.start()
-        for w in worker_apps: await w.start()
+        for w in worker_apps:
+            if not w.is_connected:
+                await w.start()
         print(f"✅ Bots Online.")
+        
+        # Resume pending jobs
+        active_jobs = await get_all_jobs()
+        if active_jobs:
+            print(f"🔄 Resuming {len(active_jobs)} jobs.")
+            for (chat_id,) in active_jobs:
+                asyncio.create_task(manager_logic(chat_id))
+        
         await idle()
         await main_app.stop()
         if premium_app: await premium_app.stop()
